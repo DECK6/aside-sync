@@ -1,0 +1,1257 @@
+#!/usr/bin/env python3
+"""aside-syncd v2: shared-folder orchestration for aside-sync."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import getpass
+import hashlib
+import json
+import os
+import plistlib
+import secrets
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+DEFAULT_CONFIG = Path.home() / ".aside" / "sync" / "config.json"
+DEFAULT_STATE = Path.home() / ".aside" / "sync" / "state.json"
+DEFAULT_ASIDE_ROOT = Path.home() / ".aside" / "u" / "0"
+DEFAULT_ASIDE_SYNC = Path.home() / ".aside" / "tools" / "aside-sync"
+DEFAULT_LOG = Path.home() / ".aside" / "logs" / "aside-syncd.log"
+LOCK_SCHEMA = 1
+CONFIG_SCHEMA = 2
+STATE_SCHEMA = 2
+INDEX_SCHEMA = 2
+LOG_LIMIT = 5 * 1024 * 1024
+
+
+class DaemonError(RuntimeError):
+    pass
+
+
+def now_epoch() -> int:
+    return int(dt.datetime.now(dt.timezone.utc).timestamp())
+
+
+def sanitize_device_id(value: str) -> str:
+    result = "".join(c if c.isalnum() or c in "-_" else "-" for c in value.strip())
+    return result.strip("-") or "device"
+
+
+def valid_sync_id(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and all(c.isalnum() or c in "-_" for c in value)
+
+
+def load_json(path: Path, default):
+    path = path.expanduser()
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise DaemonError(f"invalid JSON file {path}: {exc}") from exc
+
+
+def save_json(path: Path, data) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def default_config() -> dict:
+    return {
+        "schemaVersion": CONFIG_SCHEMA,
+        "deviceId": sanitize_device_id(socket.gethostname()),
+        "asideRoot": str(DEFAULT_ASIDE_ROOT),
+        "agentId": "main",
+        "asideSyncPath": str(DEFAULT_ASIDE_SYNC),
+        "syncDir": "",
+        "intervalSeconds": 300,
+        "exportStatuses": ["idle", "interrupted", "errored"],
+        "scope": {"mode": "all", "afterDate": None, "sessionIds": [], "excludeStatuses": []},
+        "files": {"artifacts": True, "attachments": False},
+        "security": {
+            "encryption": "none", "encryptIndex": False, "titlesInIndex": True,
+            "keyFile": str(Path.home() / ".aside" / "sync" / "age.key"),
+            "keychainService": "aside-syncd",
+        },
+        "locks": {"leaseSeconds": 900, "graceSeconds": 120},
+        "conflictPolicy": "record",
+        "logPath": str(DEFAULT_LOG),
+    }
+
+
+def migrate_v1_config(old: dict) -> dict:
+    config = default_config()
+    for key in (
+        "deviceId", "asideRoot", "agentId", "asideSyncPath", "syncDir",
+        "intervalSeconds", "exportStatuses", "logPath",
+    ):
+        if key in old:
+            config[key] = old[key]
+    old_policy = old.get("conflictPolicy")
+    config["conflictPolicy"] = old_policy if old_policy in ("record", "fork") else "record"
+    return config
+
+
+def validate_config(config: dict) -> dict:
+    version = config.get("schemaVersion")
+    if version != CONFIG_SCHEMA:
+        if isinstance(version, int) and version > CONFIG_SCHEMA:
+            raise DaemonError(f"config schemaVersion {version} is newer than supported; upgrade aside-syncd")
+        raise DaemonError("unsupported config schemaVersion; run setup or init")
+    if not valid_sync_id(config.get("deviceId")) or not valid_sync_id(config.get("agentId")) or not config.get("syncDir"):
+        raise DaemonError("config requires non-empty deviceId and syncDir")
+    if config.get("conflictPolicy") not in ("record", "fork"):
+        raise DaemonError("conflictPolicy must be record or fork")
+    mode = (config.get("scope") or {}).get("mode")
+    if mode not in ("all", "after", "selected"):
+        raise DaemonError("scope.mode must be all, after, or selected")
+    if mode == "after":
+        parse_after_date((config.get("scope") or {}).get("afterDate"))
+    if mode == "selected" and not (config.get("scope") or {}).get("sessionIds"):
+        raise DaemonError("scope.selected requires at least one session id")
+    encryption = (config.get("security") or {}).get("encryption")
+    if encryption not in ("none", "age", "gpg", "openssl"):
+        raise DaemonError("security.encryption must be none, age, gpg, or openssl")
+    if (config.get("security") or {}).get("encryptIndex") and encryption == "none":
+        raise DaemonError("encryptIndex requires an encryption backend")
+    if int(config.get("intervalSeconds") or 0) <= 0:
+        raise DaemonError("intervalSeconds must be positive")
+    locks = config.get("locks") or {}
+    if int(locks.get("leaseSeconds") or 0) <= 0 or int(locks.get("graceSeconds") or -1) < 0:
+        raise DaemonError("lock leaseSeconds must be positive and graceSeconds non-negative")
+    if encryption == "age":
+        sync_dir = Path(config["syncDir"]).expanduser().resolve()
+        key_file = Path((config.get("security") or {}).get("keyFile") or "").expanduser().resolve()
+        if key_file == sync_dir or key_file.is_relative_to(sync_dir):
+            raise DaemonError("age keyFile must never be inside syncDir")
+    return config
+
+
+def load_config(path_value: str, *, migrate: bool = True) -> dict:
+    path = Path(path_value).expanduser()
+    config = load_json(path, None)
+    if config is None:
+        raise DaemonError(f"config not found; run aside-syncd setup or init: {path}")
+    if "schemaVersion" not in config:
+        migrated = migrate_v1_config(config)
+        if migrate:
+            backup = path.with_name(path.name + ".v1.bak")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+            save_json(path, migrated)
+        config = migrated
+    return validate_config(config)
+
+
+def load_state(path: Path) -> tuple[dict, bool]:
+    state = load_json(path, {"schemaVersion": STATE_SCHEMA, "sessions": {}})
+    changed = False
+    if state.get("schemaVersion") != STATE_SCHEMA:
+        if state.get("schemaVersion") and state["schemaVersion"] > STATE_SCHEMA:
+            raise DaemonError("state file is newer than this aside-syncd")
+        state.pop("version", None)
+        state["schemaVersion"] = STATE_SCHEMA
+        state.setdefault("sessions", {})
+        changed = True
+    return state, changed
+
+
+def ensure_skeleton(sync_dir: Path) -> None:
+    for name in ("bundles", "indexes", "locks", "conflicts", ".staging"):
+        (sync_dir / name).mkdir(parents=True, exist_ok=True)
+
+
+def move_to_trash(path: Path, trash_dir: Path | None = None) -> Path:
+    trash = trash_dir or (Path.home() / ".Trash")
+    trash.mkdir(parents=True, exist_ok=True)
+    base = f"{path.name}.{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    target = trash / base
+    index = 1
+    while target.exists():
+        target = trash / f"{base}.{index}"
+        index += 1
+    shutil.move(str(path), str(target))
+    return target
+
+
+def rotate_log(path: Path, config: dict) -> None:
+    if not path.exists() or path.stat().st_size < LOG_LIMIT:
+        return
+    oldest = Path(str(path) + ".3")
+    if oldest.exists():
+        configured_trash = config.get("trashDir")
+        move_to_trash(oldest, Path(configured_trash).expanduser() if configured_trash else None)
+    for number in (2, 1):
+        source = Path(str(path) + f".{number}")
+        if source.exists():
+            os.replace(source, Path(str(path) + f".{number + 1}"))
+    os.replace(path, Path(str(path) + ".1"))
+
+
+def structured_log(config: dict, event: str, **fields) -> None:
+    path = Path(config.get("logPath") or DEFAULT_LOG).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rotate_log(path, config)
+    record = {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "event": event, **fields}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def connect_db(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(str(path), timeout=5.0)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
+
+
+def session_dir(aside_root: Path, sid: str, agent_id: str = "main") -> Path | None:
+    root = aside_root / "agents" / agent_id / "sessions"
+    if not root.exists():
+        return None
+    matches = sorted(path for path in root.iterdir() if path.is_dir() and path.name.endswith("_" + sid))
+    return matches[-1] if matches else None
+
+
+def messages_hash(aside_root: Path, sid: str, agent_id: str = "main") -> str | None:
+    directory = session_dir(aside_root, sid, agent_id)
+    if not directory or not (directory / "messages.jsonl").is_file():
+        return None
+    digest = hashlib.sha256()
+    with (directory / "messages.jsonl").open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_after_date(value: str) -> int:
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise DaemonError(f"invalid scope.afterDate: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return int(parsed.timestamp())
+
+
+def local_sessions(config: dict) -> list[dict]:
+    root = Path(config["asideRoot"]).expanduser()
+    database = root / "state.db"
+    if not database.is_file():
+        raise DaemonError(f"state.db not found: {database}")
+    con = connect_db(database)
+    try:
+        rows = [dict(row) for row in con.execute(
+            "SELECT id,title,status,created_at,updated_at,archived_at,ephemeral "
+            "FROM sessions WHERE archived_at IS NULL AND ephemeral=0 ORDER BY updated_at DESC"
+        )]
+    finally:
+        con.close()
+    scope = config.get("scope") or {}
+    mode = scope.get("mode", "all")
+    if mode == "after":
+        threshold = parse_after_date(scope.get("afterDate"))
+        rows = [row for row in rows if int(row.get("created_at") or 0) >= threshold]
+    elif mode == "selected":
+        selected = set(scope.get("sessionIds") or [])
+        rows = [row for row in rows if row["id"] in selected]
+    excluded = set(scope.get("excludeStatuses") or [])
+    return [row for row in rows if row.get("status") not in excluded]
+
+
+def read_lock(sync_dir: Path, sid: str) -> dict | None:
+    return load_json(sync_dir / "locks" / f"{sid}.json", None)
+
+
+def try_acquire_lock(
+    sync_dir: Path, sid: str, device_id: str, session_hash: str,
+    lease_seconds: int, grace_seconds: int, *, now: int | None = None, force: bool = False,
+) -> tuple[bool, dict]:
+    current_time = now_epoch() if now is None else int(now)
+    current = read_lock(sync_dir, sid)
+    valid_foreign = bool(
+        current and current.get("ownerDeviceId") != device_id
+        and int(current.get("leaseUntil") or 0) >= current_time - int(grace_seconds)
+    )
+    if valid_foreign and not force:
+        return False, current
+    takeover = bool(current and current.get("ownerDeviceId") not in (None, device_id) and force)
+    acquired_at = (
+        int(current.get("acquiredAt") or current_time)
+        if current and current.get("ownerDeviceId") == device_id and int(current.get("leaseUntil") or 0) > 0
+        else current_time
+    )
+    record = {
+        "schemaVersion": LOCK_SCHEMA,
+        "sessionId": sid,
+        "ownerDeviceId": device_id,
+        "acquiredAt": acquired_at,
+        "leaseUntil": current_time + int(lease_seconds),
+        "updatedAt": current_time,
+        "sessionHash": session_hash,
+    }
+    if takeover:
+        record["takeover"] = True
+    save_json(sync_dir / "locks" / f"{sid}.json", record)
+    return True, record
+
+
+def release_lock(sync_dir: Path, sid: str, device_id: str, *, now: int | None = None) -> dict:
+    current_time = now_epoch() if now is None else int(now)
+    current = read_lock(sync_dir, sid) or {}
+    record = {
+        "schemaVersion": LOCK_SCHEMA,
+        "sessionId": sid,
+        "ownerDeviceId": device_id,
+        "acquiredAt": int(current.get("acquiredAt") or current_time),
+        "leaseUntil": 0,
+        "updatedAt": current_time,
+        "sessionHash": current.get("sessionHash") or "",
+    }
+    save_json(sync_dir / "locks" / f"{sid}.json", record)
+    return record
+
+
+def suffix_for(backend: str) -> str:
+    return {"none": "", "age": ".age", "gpg": ".gpg", "openssl": ".enc"}[backend]
+
+
+# macOS-only: retrieve a symmetric passphrase without placing it in argv.
+def macos_keychain_passphrase(service: str) -> str:
+    if sys.platform != "darwin":
+        raise DaemonError("ASIDE_SYNC_PASSPHRASE is required outside macOS")
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-w", "-s", service], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise DaemonError(f"cannot read encryption passphrase from Keychain service {service!r}") from exc
+    return result.stdout.rstrip("\n")
+
+
+def command_env(config: dict) -> dict:
+    environment = os.environ.copy()
+    backend = (config.get("security") or {}).get("encryption", "none")
+    if backend in ("gpg", "openssl") and not environment.get("ASIDE_SYNC_PASSPHRASE"):
+        environment["ASIDE_SYNC_PASSPHRASE"] = macos_keychain_passphrase(
+            (config.get("security") or {}).get("keychainService") or "aside-syncd"
+        )
+    return environment
+
+
+def run_process(command: list[str], *, config: dict, input_text: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            command, text=True, input=input_text, env=command_env(config), check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise DaemonError(f"required program not installed: {command[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "command failed").strip()
+        raise DaemonError(f"command failed ({command[0]}): {detail}") from exc
+
+
+def core_command(config: dict, operation: list[str]) -> dict:
+    executable = str(Path(config["asideSyncPath"]).expanduser())
+    command = [executable, "--aside-root", str(Path(config["asideRoot"]).expanduser()), "--agent-id", config.get("agentId", "main"), *operation]
+    result = run_process(command, config=config)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DaemonError(f"aside-sync returned invalid JSON: {result.stdout!r}") from exc
+
+
+def encryption_arguments(config: dict, *, decrypt: bool = False) -> list[str]:
+    security = config.get("security") or {}
+    backend = security.get("encryption", "none")
+    arguments = ["--encryption", "auto" if decrypt else backend]
+    if backend == "age":
+        arguments += ["--key-file", str(Path(security["keyFile"]).expanduser())]
+    return arguments
+
+
+def crypt_index(config: dict, source: Path, destination: Path, *, decrypt: bool) -> None:
+    security = config.get("security") or {}
+    backend = security.get("encryption", "none")
+    environment_pass = command_env(config).get("ASIDE_SYNC_PASSPHRASE", "") + "\n"
+    if backend == "age":
+        key = str(Path(security["keyFile"]).expanduser())
+        if decrypt:
+            command = ["age", "-d", "-i", key, "-o", str(destination), str(source)]
+        else:
+            recipient = run_process(["age-keygen", "-y", key], config=config).stdout.strip()
+            command = ["age", "-e", "-r", recipient, "-o", str(destination), str(source)]
+        run_process(command, config=config)
+    elif backend == "gpg":
+        if decrypt:
+            command = ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--decrypt", "--output", str(destination), str(source)]
+        else:
+            command = ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--symmetric", "--cipher-algo", "AES256", "--output", str(destination), str(source)]
+        run_process(command, config=config, input_text=environment_pass)
+    elif backend == "openssl":
+        command = ["openssl", "enc"]
+        if decrypt:
+            command.append("-d")
+        command += ["-aes-256-cbc", "-pbkdf2", "-iter", "600000", "-pass", "stdin", "-in", str(source), "-out", str(destination)]
+        if not decrypt:
+            command.insert(3, "-salt")
+        run_process(command, config=config, input_text=environment_pass)
+    else:
+        shutil.copyfile(source, destination)
+
+
+def bundle_path(config: dict, sid: str, device: str, message_hash: str) -> Path:
+    backend = (config.get("security") or {}).get("encryption", "none")
+    return Path(config["syncDir"]).expanduser() / "bundles" / sid / f"{device}-{message_hash[:16]}.tgz{suffix_for(backend)}"
+
+
+def session_allowed_for_export(config: dict, row: dict) -> bool:
+    allowed = set(config.get("exportStatuses") or [])
+    return not allowed or row.get("status") in allowed
+
+
+def export_sessions(config: dict, state: dict, *, dry_run: bool = False, force_sids: set[str] | None = None) -> tuple[list[str], list[dict], list[dict]]:
+    force_sids = force_sids or set()
+    aside_root = Path(config["asideRoot"]).expanduser()
+    sync_dir = Path(config["syncDir"]).expanduser()
+    device = config["deviceId"]
+    locks = config.get("locks") or {}
+    exported, skipped, planned = [], [], []
+    for row in local_sessions(config):
+        sid = row["id"]
+        if not valid_sync_id(sid):
+            skipped.append({"sessionId": sid, "reason": "unsafe-local-session-id"})
+            continue
+        message_hash = messages_hash(aside_root, sid, config.get("agentId", "main"))
+        if not message_hash or not session_allowed_for_export(config, row):
+            continue
+        session_state = state.setdefault("sessions", {}).setdefault(sid, {})
+        force = sid in force_sids
+        if not force and session_state.get("lastExportedHash") == message_hash:
+            continue
+        current = read_lock(sync_dir, sid)
+        current_time = now_epoch()
+        grace = int(locks.get("graceSeconds", 120))
+        foreign = bool(current and current.get("ownerDeviceId") != device and int(current.get("leaseUntil") or 0) >= current_time - grace)
+        if foreign and not force:
+            skipped.append({"sessionId": sid, "reason": "foreign-lock", "ownerDeviceId": current.get("ownerDeviceId")})
+            continue
+        output = bundle_path(config, sid, device, message_hash)
+        if dry_run:
+            planned.append({"action": "export", "sessionId": sid, "bundlePath": str(output), "claimLock": True})
+            continue
+        acquired, record = try_acquire_lock(
+            sync_dir, sid, device, message_hash,
+            int(locks.get("leaseSeconds", 900)), grace, force=force,
+        )
+        if not acquired:
+            skipped.append({"sessionId": sid, "reason": "foreign-lock", "ownerDeviceId": record.get("ownerDeviceId")})
+            continue
+        output.parent.mkdir(parents=True, exist_ok=True)
+        files = config.get("files") or {}
+        operation = ["export-bundle", sid, "--output", str(output), "--source-device-id", device]
+        if not files.get("artifacts", True):
+            operation.append("--no-artifacts")
+        if files.get("attachments", False):
+            operation.append("--include-attachments")
+        operation += encryption_arguments(config)
+        core_command(config, operation)
+        session_state["lastExportedHash"] = message_hash
+        session_state["lastExportedAt"] = now_epoch()
+        exported.append(sid)
+    return exported, skipped, planned
+
+
+def make_index(config: dict) -> dict:
+    aside_root = Path(config["asideRoot"]).expanduser()
+    security = config.get("security") or {}
+    sessions = []
+    for row in local_sessions(config):
+        if not valid_sync_id(row.get("id")):
+            continue
+        message_hash = messages_hash(aside_root, row["id"], config.get("agentId", "main"))
+        if not message_hash:
+            continue
+        item = {
+            "id": row["id"], "status": row.get("status"),
+            "createdAt": row.get("created_at"), "updatedAt": row.get("updated_at"),
+            "messagesSha256": message_hash,
+        }
+        if security.get("titlesInIndex", True):
+            item["title"] = row.get("title")
+        sessions.append(item)
+    return {"schemaVersion": INDEX_SCHEMA, "deviceId": config["deviceId"], "heartbeatAt": now_epoch(), "sessions": sessions}
+
+
+def write_index(config: dict, index: dict) -> Path:
+    sync_dir = Path(config["syncDir"]).expanduser()
+    security = config.get("security") or {}
+    backend = security.get("encryption", "none") if security.get("encryptIndex", False) else "none"
+    suffix = suffix_for(backend)
+    final = sync_dir / "indexes" / f"{config['deviceId']}.json{suffix}"
+    if backend == "none":
+        save_json(final, index)
+        return final
+    with tempfile.TemporaryDirectory(prefix="aside-sync-index-") as temporary:
+        plain = Path(temporary) / "index.json"
+        plain.write_text(json.dumps(index, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        staged = final.with_name(final.name + ".tmp")
+        crypt_index(config, plain, staged, decrypt=False)
+        os.replace(staged, final)
+    return final
+
+
+def read_indexes(config: dict) -> list[tuple[Path, dict]]:
+    directory = Path(config["syncDir"]).expanduser() / "indexes"
+    if not directory.exists():
+        return []
+    results = []
+    for path in sorted(directory.glob("*.json*")):
+        if path.name.endswith(".tmp"):
+            continue
+        if path.suffix == ".json":
+            data = load_json(path, {})
+        else:
+            expected = suffix_for((config.get("security") or {}).get("encryption", "none"))
+            if not expected or not path.name.endswith(expected):
+                continue
+            with tempfile.TemporaryDirectory(prefix="aside-sync-index-read-") as temporary:
+                plain = Path(temporary) / "index.json"
+                crypt_index(config, path, plain, decrypt=True)
+                data = load_json(plain, {})
+        if data.get("schemaVersion") == INDEX_SCHEMA:
+            results.append((path, data))
+    return results
+
+
+def find_bundle(config: dict, sid: str, source: str, remote_hash: str) -> Path | None:
+    directory = Path(config["syncDir"]).expanduser() / "bundles" / sid
+    if not directory.exists():
+        return None
+    exact_stem = f"{source}-{remote_hash[:16]}.tgz"
+    candidates = sorted(path for path in directory.glob(exact_stem + "*") if path.is_file())
+    return candidates[-1] if candidates else None
+
+
+def unresolved_duplicate(sync_dir: Path, record: dict) -> Path | None:
+    directory = sync_dir / "conflicts"
+    if not directory.exists():
+        return None
+    keys = ("sessionId", "sourceDeviceId", "localHash", "remoteHash")
+    for path in sorted(directory.glob(f"{record['sessionId']}-*.json"), reverse=True):
+        current = load_json(path, {})
+        if current.get("resolution") is None and all(current.get(key) == record.get(key) for key in keys):
+            return path
+    return None
+
+
+def record_conflict(config: dict, sid: str, source: str, local_hash: str, remote_hash: str, bundle: Path) -> tuple[Path, dict]:
+    sync_dir = Path(config["syncDir"]).expanduser()
+    detected = now_epoch()
+    record = {
+        "sessionId": sid,
+        "localDeviceId": config["deviceId"],
+        "sourceDeviceId": source,
+        "localHash": local_hash,
+        "remoteHash": remote_hash,
+        "bundlePath": str(bundle),
+        "detectedAt": detected,
+        "resolution": None,
+    }
+    duplicate = unresolved_duplicate(sync_dir, record)
+    if duplicate:
+        return duplicate, load_json(duplicate, record)
+    path = sync_dir / "conflicts" / f"{sid}-{detected}.json"
+    while path.exists():
+        detected += 1
+        path = sync_dir / "conflicts" / f"{sid}-{detected}.json"
+    record["detectedAt"] = detected
+    save_json(path, record)
+    return path, record
+
+
+def import_operation(config: dict, bundle: Path, *flags: str) -> dict:
+    operation = ["import-bundle", str(bundle), *flags, *encryption_arguments(config, decrypt=True)]
+    return core_command(config, operation)
+
+
+def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    aside_root = Path(config["asideRoot"]).expanduser()
+    local_device = config["deviceId"]
+    local_map = {row["id"]: row for row in local_sessions(config)}
+    imported, skipped, conflicts, planned = [], [], [], []
+    for _, index in read_indexes(config):
+        source = index.get("deviceId")
+        if not source or source == local_device:
+            continue
+        if not valid_sync_id(source):
+            skipped.append({"sessionId": None, "reason": "unsafe-remote-device-id"})
+            continue
+        for remote in index.get("sessions") or []:
+            sid = remote.get("id")
+            remote_hash = remote.get("messagesSha256")
+            if not sid or not remote_hash:
+                continue
+            if not valid_sync_id(sid) or not isinstance(remote_hash, str) or len(remote_hash) != 64 or any(c not in "0123456789abcdef" for c in remote_hash.lower()):
+                skipped.append({"sessionId": sid, "reason": "unsafe-remote-index-entry", "sourceDeviceId": source})
+                continue
+            bundle = find_bundle(config, sid, source, remote_hash)
+            if bundle is None:
+                skipped.append({"sessionId": sid, "reason": "bundle-missing", "sourceDeviceId": source})
+                continue
+            session_state = state.setdefault("sessions", {}).setdefault(sid, {})
+            local = local_map.get(sid)
+            local_hash = messages_hash(aside_root, sid, config.get("agentId", "main")) if local else None
+            if local_hash == remote_hash:
+                session_state["lastImportedHash"] = remote_hash
+                session_state.setdefault("imports", {})[source] = {"hash": remote_hash, "importedAt": now_epoch()}
+                session_state.setdefault("lastExportedHash", remote_hash)
+                continue
+            if local and local.get("status") == "running":
+                skipped.append({"sessionId": sid, "reason": "local-running", "sourceDeviceId": source})
+                continue
+            last_imported = session_state.get("lastImportedHash")
+            diverged = bool(local and (last_imported is None or (local_hash != last_imported and remote_hash != last_imported)))
+            if diverged:
+                if dry_run:
+                    planned.append({"action": "record-conflict", "sessionId": sid, "sourceDeviceId": source})
+                    continue
+                path, record = record_conflict(config, sid, source, local_hash, remote_hash, bundle)
+                if config.get("conflictPolicy") == "fork" and record.get("resolution") is None:
+                    result = import_operation(config, bundle, "--session-id", sid, "--as-new-session")
+                    record["resolution"] = f"forked:{result['imported']}"
+                    save_json(path, record)
+                conflicts.append(record)
+                continue
+            flags = ("--session-id", sid, "--update-existing") if local else ("--session-id", sid)
+            if dry_run:
+                planned.append({"action": "import", "sessionId": sid, "sourceDeviceId": source, "updateExisting": bool(local)})
+                continue
+            result = import_operation(config, bundle, *flags)
+            session_state["lastImportedHash"] = remote_hash
+            session_state["lastExportedHash"] = remote_hash
+            session_state.setdefault("imports", {})[source] = {"hash": remote_hash, "importedAt": now_epoch()}
+            imported.append({"sessionId": sid, "sourceDeviceId": source, "updated": bool(local), "result": result["mode"]})
+            local_map = {row["id"]: row for row in local_sessions(config)}
+    return imported, skipped, conflicts, planned
+
+
+def run_once(args) -> None:
+    dry_run = bool(getattr(args, "dry_run", False))
+    config = load_config(args.config, migrate=not dry_run)
+    state_path = Path(args.state).expanduser()
+    state, _ = load_state(state_path)
+    sync_dir = Path(config["syncDir"]).expanduser()
+    if not dry_run:
+        ensure_skeleton(sync_dir)
+    exported, export_skipped, export_plan = export_sessions(config, state, dry_run=dry_run)
+    if not dry_run:
+        write_index(config, make_index(config))
+    imported, import_skipped, conflicts, import_plan = import_remote(config, state, dry_run=dry_run)
+    report = {
+        "exported": exported,
+        "imported": imported,
+        "skipped": export_skipped + import_skipped,
+        "conflicts": conflicts,
+    }
+    if dry_run:
+        report = {"dryRun": True, **report, "actions": export_plan + [{"action": "write-index"}] + import_plan}
+    else:
+        save_json(state_path, state)
+        structured_log(config, "sync-cycle", report=report)
+    print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+
+
+def daemon(args) -> None:
+    config = load_config(args.config)
+    interval = int(args.interval or config.get("intervalSeconds", 300))
+    structured_log(config, "daemon-start", intervalSeconds=interval)
+    while True:
+        try:
+            run_once(argparse.Namespace(config=args.config, state=args.state, dry_run=False))
+        except Exception as exc:  # Keep the foreground daemon alive; run-once remains fail-fast.
+            structured_log(config, "sync-error", errorType=type(exc).__name__, error=str(exc))
+        time.sleep(interval)
+
+
+def init_config(args) -> None:
+    config = default_config()
+    config.update({
+        "deviceId": sanitize_device_id(args.device_id or socket.gethostname()),
+        "asideRoot": str(Path(args.aside_root).expanduser()),
+        "asideSyncPath": str(Path(args.aside_sync_path).expanduser()),
+        "syncDir": str(Path(args.sync_dir).expanduser().resolve()),
+        "intervalSeconds": int(args.interval),
+        "conflictPolicy": args.conflict_policy,
+        "logPath": str(Path(args.log_path).expanduser()),
+    })
+    config["security"].update({
+        "encryption": args.encryption,
+        "encryptIndex": bool(args.encrypt_index),
+        "titlesInIndex": not bool(args.no_titles_in_index),
+        "keyFile": str(Path(args.key_file).expanduser()),
+        "keychainService": args.keychain_service,
+    })
+    config["files"] = {"artifacts": not args.no_artifacts, "attachments": bool(args.attachments)}
+    config["scope"] = {
+        "mode": args.scope, "afterDate": args.after_date,
+        "sessionIds": args.session_id or [], "excludeStatuses": args.exclude_status or [],
+    }
+    validate_config(config)
+    save_json(Path(args.config), config)
+    ensure_skeleton(Path(config["syncDir"]))
+    print(json.dumps({"config": str(Path(args.config).expanduser()), "deviceId": config["deviceId"], "syncDir": config["syncDir"]}, indent=2))
+
+
+def claim(args) -> None:
+    config = load_config(args.config)
+    if not valid_sync_id(args.session_id):
+        raise DaemonError("unsafe session id")
+    sync_dir = Path(config["syncDir"]).expanduser()
+    ensure_skeleton(sync_dir)
+    message_hash = messages_hash(Path(config["asideRoot"]).expanduser(), args.session_id, config.get("agentId", "main"))
+    if not message_hash:
+        raise DaemonError(f"local session messages not found: {args.session_id}")
+    locks = config.get("locks") or {}
+    _, record = try_acquire_lock(
+        sync_dir, args.session_id, config["deviceId"], message_hash,
+        int(locks.get("leaseSeconds", 900)), int(locks.get("graceSeconds", 120)), force=True,
+    )
+    structured_log(config, "lock-takeover", sessionId=args.session_id)
+    print(json.dumps(record, indent=2))
+
+
+def release(args) -> None:
+    config = load_config(args.config)
+    if not valid_sync_id(args.session_id):
+        raise DaemonError("unsafe session id")
+    sync_dir = Path(config["syncDir"]).expanduser()
+    ensure_skeleton(sync_dir)
+    record = release_lock(sync_dir, args.session_id, config["deviceId"])
+    structured_log(config, "lock-release", sessionId=args.session_id)
+    print(json.dumps(record, indent=2))
+
+
+def find_unresolved_conflict(config: dict, sid: str) -> tuple[Path, dict]:
+    directory = Path(config["syncDir"]).expanduser() / "conflicts"
+    for path in sorted(directory.glob(f"{sid}-*.json"), reverse=True):
+        record = load_json(path, {})
+        if record.get("resolution") is None:
+            return path, record
+    raise DaemonError(f"no unresolved conflict for session: {sid}")
+
+
+def resolve(args) -> None:
+    config = load_config(args.config)
+    if not valid_sync_id(args.session_id):
+        raise DaemonError("unsafe session id")
+    state_path = Path(args.state).expanduser()
+    state, _ = load_state(state_path)
+    ensure_skeleton(Path(config["syncDir"]).expanduser())
+    path, record = find_unresolved_conflict(config, args.session_id)
+    bundle = Path(record["bundlePath"])
+    bundles_root = (Path(config["syncDir"]).expanduser() / "bundles").resolve()
+    try:
+        resolved_bundle = bundle.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise DaemonError(f"conflict bundle no longer exists: {bundle}") from exc
+    if not resolved_bundle.is_relative_to(bundles_root):
+        raise DaemonError("conflict bundlePath points outside syncDir/bundles")
+    bundle = resolved_bundle
+    if args.take == "fork":
+        result = import_operation(config, bundle, "--session-id", args.session_id, "--as-new-session")
+        resolution = f"forked:{result['imported']}"
+    elif args.take == "remote":
+        result = import_operation(config, bundle, "--session-id", args.session_id, "--update-existing", "--force")
+        session_state = state.setdefault("sessions", {}).setdefault(args.session_id, {})
+        session_state["lastImportedHash"] = record["remoteHash"]
+        session_state["lastExportedHash"] = record["remoteHash"]
+        session_state.setdefault("imports", {})[record["sourceDeviceId"]] = {"hash": record["remoteHash"], "importedAt": now_epoch()}
+        resolution = "remote"
+    else:
+        exported, skipped, _ = export_sessions(config, state, force_sids={args.session_id})
+        if args.session_id not in exported:
+            raise DaemonError(f"could not force-export local resolution: {skipped}")
+        write_index(config, make_index(config))
+        resolution = "local"
+    record["resolution"] = resolution
+    save_json(path, record)
+    save_json(state_path, state)
+    structured_log(config, "conflict-resolved", sessionId=args.session_id, resolution=resolution)
+    print(json.dumps({"sessionId": args.session_id, "resolution": resolution, "recordPath": str(path)}, indent=2))
+
+
+def status(args) -> None:
+    config = load_config(args.config)
+    sync_dir = Path(config["syncDir"]).expanduser()
+    state, _ = load_state(Path(args.state).expanduser())
+    indexes = []
+    for _, index in read_indexes(config):
+        indexes.append({"deviceId": index.get("deviceId"), "heartbeatAt": index.get("heartbeatAt"), "sessions": len(index.get("sessions") or [])})
+    conflicts = []
+    conflict_dir = sync_dir / "conflicts"
+    if conflict_dir.exists():
+        conflicts = [load_json(path, {}) for path in sorted(conflict_dir.glob("*.json")) if load_json(path, {}).get("resolution") is None]
+    print(json.dumps({
+        "deviceId": config["deviceId"], "syncDir": str(sync_dir), "indexes": indexes,
+        "trackedSessions": len(state.get("sessions") or {}), "unresolvedConflicts": conflicts,
+    }, ensure_ascii=False, indent=2))
+
+
+def numbered_choice(prompt: str, choices: list[str], default: int) -> int:
+    for index, choice in enumerate(choices, 1):
+        marker = " (default)" if index == default else ""
+        print(f"  {index}. {choice}{marker}")
+    while True:
+        answer = input(f"{prompt} [{default}]: ").strip()
+        if not answer:
+            return default
+        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+            return int(answer)
+        print(f"Please enter a number from 1 to {len(choices)}.")
+
+
+def yes_no(prompt: str, default: bool = False) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"{prompt} [{hint}]: ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please answer y or n.")
+
+
+def detected_sync_roots() -> list[Path]:
+    home = Path.home()
+    candidates = [home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"]
+    candidates += sorted((home / "Library" / "CloudStorage").glob("Dropbox*"))
+    candidates += [home / "Dropbox"]
+    # Google Drive localizes the folder name per system language.
+    my_drive_names = (
+        "My Drive", "내 드라이브", "マイドライブ", "我的云端硬盘", "Mi unidad",
+        "Meine Ablage", "Mon Drive", "Il mio Drive", "Meu Drive", "Мой диск",
+    )
+    for mount in sorted((home / "Library" / "CloudStorage").glob("GoogleDrive-*")):
+        candidates += [mount / name for name in my_drive_names]
+    candidates += [home / "Syncthing"]
+    seen, existing = set(), []
+    for path in candidates:
+        if path.exists() and path not in seen:
+            existing.append(path)
+            seen.add(path)
+    return existing
+
+
+def looks_cloud_path(path: Path) -> bool:
+    text = str(path).lower()
+    markers = ("cloudstorage", "mobile documents", "dropbox", "googledrive", "google drive", "onedrive")
+    return any(marker in text for marker in markers)
+
+
+def validate_future_writable(path: Path) -> None:
+    parent = path
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise DaemonError(f"sync folder is not writable and cannot be created: {path}")
+
+
+# macOS-only: persist symmetric encryption material in the login Keychain.
+def macos_store_keychain_passphrase(service: str, value: str) -> None:
+    if sys.platform != "darwin":
+        raise DaemonError("gpg/openssl wizard key storage currently requires macOS Keychain")
+    account = os.environ.get("USER") or "aside-sync"
+    try:
+        subprocess.run(
+            ["security", "add-generic-password", "-U", "-a", account, "-s", service, "-w", value],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise DaemonError(f"failed to store passphrase in macOS Keychain service {service!r}") from exc
+
+
+def choose_encryption_backend(key_file: Path, keychain_service: str) -> str:
+    if shutil.which("age") and shutil.which("age-keygen"):
+        if not key_file.exists():
+            key_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                subprocess.run(["age-keygen", "-o", str(key_file)], check=True)
+            except subprocess.CalledProcessError as exc:
+                raise DaemonError("age-keygen failed") from exc
+            key_file.chmod(0o600)
+        print(f"Age key: {key_file}")
+        print("Copy this key to each device via AirDrop or USB. NEVER copy it through the sync folder.")
+        return "age"
+    if shutil.which("gpg") or shutil.which("openssl"):
+        backend = "gpg" if shutil.which("gpg") else "openssl"
+        macos_store_keychain_passphrase(keychain_service, prompt_shared_passphrase())
+        if backend == "openssl":
+            print("CAVEAT: OpenSSL AES-CBC is not authenticated; inner manifest hashes provide integrity checking.")
+        print(f"Passphrase stored in macOS Keychain service {keychain_service!r}.")
+        print("Enter the same passphrase on every device; never share it through the sync folder.")
+        return backend
+    raise DaemonError("no encryption backend installed (age, gpg, or openssl)")
+
+
+def encryption_toggle(args) -> None:
+    config = load_config(args.config)
+    security = config.setdefault("security", {})
+    if args.mode == "status":
+        print(json.dumps({
+            "encryption": security.get("encryption", "none"),
+            "encryptIndex": bool(security.get("encryptIndex")),
+        }, ensure_ascii=False, indent=2))
+        return
+    if args.mode == "off":
+        security.update({"encryption": "none", "encryptIndex": False})
+        validate_config(config)
+        save_json(Path(args.config), config)
+        print("Encryption disabled for newly exported bundles and indexes.")
+        print("Already-synced encrypted bundles stay encrypted; importing them still requires the key.")
+        if looks_cloud_path(Path(config["syncDir"]).expanduser()):
+            print("WARNING: the sync folder looks cloud-hosted; new bundles will be readable there.")
+        return
+    key_file = Path(security.get("keyFile") or (Path.home() / ".aside" / "sync" / "age.key")).expanduser()
+    keychain_service = security.get("keychainService") or "aside-syncd"
+    backend = choose_encryption_backend(key_file, keychain_service)
+    security.update({"encryption": backend, "encryptIndex": bool(args.index)})
+    validate_config(config)
+    save_json(Path(args.config), config)
+    print(f"Encryption enabled with backend {backend!r}" + (" (indexes too)." if args.index else "."))
+
+
+def prompt_shared_passphrase() -> str:
+    # Piped stdin (tests/automation) cannot use getpass, which reads /dev/tty.
+    read_secret = getpass.getpass if sys.stdin.isatty() else (lambda prompt: input(prompt).strip())
+    while True:
+        entered = read_secret("Passphrase (blank = generate random; use the SAME passphrase on every device): ").strip()
+        if not entered:
+            value = secrets.token_urlsafe(32)
+            print("Generated a random passphrase. Enter it during setup on your other devices:")
+            print(f"  {value}")
+            return value
+        if read_secret("Repeat passphrase: ").strip() == entered:
+            return entered
+        print("Passphrases do not match; try again.")
+
+
+def setup_wizard(args) -> None:
+    print("aside-sync v2 setup\n")
+    detected = detected_sync_roots()
+    suggested = detected[0] / "AsideSync" if detected else Path.home() / "AsideSync"
+    folder_choices = [str(path / "AsideSync") for path in detected] + ["custom path"]
+    folder_number = numbered_choice("Sync folder", folder_choices, 1)
+    if folder_number <= len(detected):
+        sync_dir = (detected[folder_number - 1] / "AsideSync").resolve()
+    else:
+        folder_answer = input(f"Custom sync folder [{suggested}]: ").strip()
+        sync_dir = Path(folder_answer).expanduser().resolve() if folder_answer else suggested.resolve()
+    validate_future_writable(sync_dir)
+
+    default_device = sanitize_device_id(socket.gethostname())
+    device_answer = input(f"Unique device id [{default_device}]: ").strip()
+    device_id = sanitize_device_id(device_answer or default_device)
+
+    scope_number = numbered_choice("Sync scope", ["all sessions", "sessions after a date", "selected session ids"], 1)
+    scope = {"mode": ("all", "after", "selected")[scope_number - 1], "afterDate": None, "sessionIds": [], "excludeStatuses": []}
+    if scope_number == 2:
+        while True:
+            after = input("After date (YYYY-MM-DD): ").strip()
+            try:
+                parse_after_date(after)
+                scope["afterDate"] = after
+                break
+            except DaemonError as exc:
+                print(exc)
+    elif scope_number == 3:
+        while not scope["sessionIds"]:
+            ids = input("Session ids (comma-separated): ").strip()
+            scope["sessionIds"] = [value.strip() for value in ids.split(",") if value.strip()]
+    if yes_no("Exclude errored sessions?"):
+        scope["excludeStatuses"].append("errored")
+    if yes_no("Exclude interrupted sessions?"):
+        scope["excludeStatuses"].append("interrupted")
+
+    file_number = numbered_choice(
+        "File scope",
+        ["messages only", "messages + artifacts (tmp is always excluded)", "messages + artifacts + attachments (tmp is always excluded)"],
+        2,
+    )
+    files = {"artifacts": file_number >= 2, "attachments": file_number == 3}
+
+    security_number = numbered_choice(
+        "Security",
+        ["none (trusted local folder only)", "encrypt bundles", "encrypt bundles + indexes"],
+        1,
+    )
+    backend = "none"
+    encrypt_index = False
+    key_file = Path.home() / ".aside" / "sync" / "age.key"
+    keychain_service = "aside-syncd"
+    if security_number == 1:
+        warning = "WARNING: bundles will contain readable conversation data."
+        if looks_cloud_path(sync_dir):
+            warning += " This looks like a cloud folder; encryption is strongly recommended."
+        print(warning)
+    else:
+        encrypt_index = security_number == 3
+        backend = choose_encryption_backend(key_file, keychain_service)
+
+    automation_number = numbered_choice("Automation", ["manual only", "foreground daemon", "LaunchAgent"], 1)
+    automation = ("manual", "daemon", "launchagent")[automation_number - 1]
+    config = default_config()
+    config.update({"deviceId": device_id, "syncDir": str(sync_dir), "scope": scope, "files": files})
+    config["security"].update({
+        "encryption": backend, "encryptIndex": encrypt_index,
+        "keyFile": str(key_file), "keychainService": keychain_service,
+    })
+    summary = {
+        "syncDir": str(sync_dir), "deviceId": device_id, "scope": scope,
+        "files": files, "encryption": backend, "encryptIndex": encrypt_index,
+        "automationInstructions": automation,
+    }
+    print("\nSummary:")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not yes_no("Write this configuration?"):
+        print("Setup cancelled; nothing was written.")
+        return
+    validate_config(config)
+    save_json(Path(args.config), config)
+    ensure_skeleton(sync_dir)
+    print(f"\nConfiguration written: {Path(args.config).expanduser()}")
+    print("Nothing was started. Next commands:")
+    print("  aside-syncd run-once                 # try one sync cycle")
+    print("  aside-syncd install-launchagent      # enable scheduled sync")
+    print("  aside-syncd uninstall                # undo local installation state")
+    if automation == "daemon":
+        print("  aside-syncd daemon                   # run in the foreground")
+
+
+def launchagent_path(label: str, output: str | None) -> Path:
+    return Path(output).expanduser() if output else Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def launchagent_plist(config: dict, args) -> dict:
+    log_path = str(Path(config.get("logPath") or DEFAULT_LOG).expanduser())
+    return {
+        "Label": args.label,
+        "ProgramArguments": [
+            sys.executable, str(Path(__file__).resolve()),
+            "--config", str(Path(args.config).expanduser()),
+            "--state", str(Path(args.state).expanduser()),
+            "run-once",
+        ],
+        "StartInterval": int(config.get("intervalSeconds", 300)),
+        "ProcessType": "Background",
+        "StandardOutPath": log_path,
+        "StandardErrorPath": log_path,
+    }
+
+
+# macOS-only: launchd registration. Kept out of the portable sync engine.
+def launchctl_command(command: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
+    if sys.platform != "darwin":
+        raise DaemonError("LaunchAgent commands are available only on macOS")
+    try:
+        return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+    except FileNotFoundError as exc:
+        raise DaemonError("launchctl is not available") from exc
+
+
+def install_launchagent(args) -> None:
+    config = load_config(args.config)
+    output = launchagent_path(args.label, args.output)
+    actions = [f"write {output}", f"launchctl bootstrap gui/{os.getuid()} {output}", f"launchctl enable gui/{os.getuid()}/{args.label}"]
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "actions": actions}, indent=2))
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    trashed = None
+    if output.exists():
+        trash = Path(args.trash_dir).expanduser() if getattr(args, "trash_dir", None) else None
+        trashed = move_to_trash(output, trash)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_bytes(plistlib.dumps(launchagent_plist(config, args), fmt=plistlib.FMT_XML, sort_keys=True))
+    os.replace(temporary, output)
+    domain = f"gui/{os.getuid()}"
+    result = launchctl_command(["launchctl", "bootstrap", domain, str(output)])
+    if result.returncode != 0:
+        fallback = launchctl_command(["launchctl", "load", str(output)])
+        if fallback.returncode != 0:
+            raise DaemonError(f"launchctl bootstrap/load failed: {(fallback.stderr or result.stderr).strip()}")
+    enabled = launchctl_command(["launchctl", "enable", f"{domain}/{args.label}"])
+    if enabled.returncode != 0:
+        raise DaemonError(f"launchctl enable failed: {enabled.stderr.strip()}")
+    print(json.dumps({"plist": str(output), "installed": True, "previousMovedToTrash": str(trashed) if trashed else None}, indent=2))
+
+
+def bootout_launchagent(label: str, output: Path) -> dict:
+    if sys.platform != "darwin":
+        raise DaemonError("LaunchAgent commands are available only on macOS")
+    domain = f"gui/{os.getuid()}"
+    result = launchctl_command(["launchctl", "bootout", domain, str(output)])
+    return {"command": f"launchctl bootout {domain} {output}", "returnCode": result.returncode}
+
+
+def uninstall_launchagent(args) -> None:
+    output = launchagent_path(args.label, args.output)
+    actions = [f"launchctl bootout gui/{os.getuid()} {output}", f"move {output} to Trash"]
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "actions": actions}, indent=2))
+        return
+    bootout = bootout_launchagent(args.label, output)
+    trashed = None
+    if output.exists():
+        trash = Path(args.trash_dir).expanduser() if getattr(args, "trash_dir", None) else None
+        trashed = move_to_trash(output, trash)
+    print(json.dumps({"disabled": True, "bootout": bootout, "plistMovedToTrash": str(trashed) if trashed else None}, indent=2))
+
+
+def disable(args) -> None:
+    output = launchagent_path(args.label, args.output)
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "action": f"launchctl bootout gui/{os.getuid()} {output}"}, indent=2))
+        return
+    print(json.dumps({"disabled": True, "bootout": bootout_launchagent(args.label, output), "configAndDataUntouched": True}, indent=2))
+
+
+def uninstall(args) -> None:
+    config = load_config(args.config)
+    output = launchagent_path(args.label, args.output)
+    targets = [output, Path(args.config).expanduser(), Path(args.state).expanduser()]
+    if args.dry_run:
+        print(json.dumps({
+            "dryRun": True, "actions": [f"bootout {output}"] + [f"move to Trash if present: {path}" for path in targets],
+            "intentionallyRemaining": [config["syncDir"], "Aside backups", config["security"]["keyFile"]],
+        }, indent=2))
+        return
+    bootout = bootout_launchagent(args.label, output)
+    trash = Path(args.trash_dir).expanduser() if getattr(args, "trash_dir", None) else None
+    moved = []
+    for target in targets:
+        if target.exists():
+            moved.append(str(move_to_trash(target, trash)))
+    print(json.dumps({
+        "uninstalled": True, "bootout": bootout, "movedToTrash": moved,
+        "intentionallyRemaining": {
+            "syncDir": config["syncDir"], "backups": "~/.aside/backups",
+            "keyFile": config["security"]["keyFile"],
+        },
+    }, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Shared-folder daemon for aside-sync v2")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--state", default=str(DEFAULT_STATE))
+    commands = parser.add_subparsers(dest="cmd", required=True)
+
+    command = commands.add_parser("init")
+    command.add_argument("--sync-dir", required=True)
+    command.add_argument("--device-id")
+    command.add_argument("--aside-root", default=str(DEFAULT_ASIDE_ROOT))
+    command.add_argument("--aside-sync-path", default=str(DEFAULT_ASIDE_SYNC))
+    command.add_argument("--interval", type=int, default=300)
+    command.add_argument("--scope", choices=("all", "after", "selected"), default="all")
+    command.add_argument("--after-date")
+    command.add_argument("--session-id", action="append")
+    command.add_argument("--exclude-status", action="append")
+    command.add_argument("--no-artifacts", action="store_true")
+    command.add_argument("--attachments", action="store_true")
+    command.add_argument("--encryption", choices=("none", "age", "gpg", "openssl"), default="none")
+    command.add_argument("--encrypt-index", action="store_true")
+    command.add_argument("--no-titles-in-index", action="store_true")
+    command.add_argument("--key-file", default=str(Path.home() / ".aside" / "sync" / "age.key"))
+    command.add_argument("--keychain-service", default="aside-syncd")
+    command.add_argument("--conflict-policy", choices=("record", "fork"), default="record")
+    command.add_argument("--log-path", default=str(DEFAULT_LOG))
+    command.set_defaults(func=init_config)
+
+    command = commands.add_parser("setup")
+    command.set_defaults(func=setup_wizard)
+
+    command = commands.add_parser("run-once")
+    command.add_argument("--dry-run", action="store_true")
+    command.set_defaults(func=run_once)
+
+    command = commands.add_parser("daemon")
+    command.add_argument("--interval", type=int)
+    command.set_defaults(func=daemon)
+
+    command = commands.add_parser("claim")
+    command.add_argument("session_id")
+    command.set_defaults(func=claim)
+
+    command = commands.add_parser("release")
+    command.add_argument("session_id")
+    command.set_defaults(func=release)
+
+    command = commands.add_parser("resolve")
+    command.add_argument("session_id")
+    command.add_argument("--take", choices=("local", "remote", "fork"), required=True)
+    command.set_defaults(func=resolve)
+
+    command = commands.add_parser("status")
+    command.set_defaults(func=status)
+
+    command = commands.add_parser("encryption")
+    command.add_argument("mode", choices=("on", "off", "status"))
+    command.add_argument("--index", action="store_true", help="also encrypt device indexes when enabling")
+    command.set_defaults(func=encryption_toggle)
+
+    command = commands.add_parser("install-launchagent")
+    command.add_argument("--label", default="com.deck.aside-syncd")
+    command.add_argument("--output")
+    command.add_argument("--dry-run", action="store_true")
+    command.add_argument("--trash-dir", help=argparse.SUPPRESS)
+    command.set_defaults(func=install_launchagent)
+
+    command = commands.add_parser("uninstall-launchagent")
+    command.add_argument("--label", default="com.deck.aside-syncd")
+    command.add_argument("--output")
+    command.add_argument("--dry-run", action="store_true")
+    command.add_argument("--trash-dir", help=argparse.SUPPRESS)
+    command.set_defaults(func=uninstall_launchagent)
+
+    command = commands.add_parser("disable")
+    command.add_argument("--label", default="com.deck.aside-syncd")
+    command.add_argument("--output")
+    command.add_argument("--dry-run", action="store_true")
+    command.set_defaults(func=disable)
+
+    command = commands.add_parser("uninstall")
+    command.add_argument("--label", default="com.deck.aside-syncd")
+    command.add_argument("--output")
+    command.add_argument("--dry-run", action="store_true")
+    command.add_argument("--trash-dir", help=argparse.SUPPRESS)
+    command.set_defaults(func=uninstall)
+    return parser
+
+
+def main(argv=None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+        args.func(args)
+        return 0
+    except (DaemonError, OSError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

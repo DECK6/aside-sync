@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""aside-sync v2: secure Aside session bundle and transport engine."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import random
+import shutil
+import socket
+import sqlite3
+import string
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path, PurePosixPath
+
+
+DEFAULT_USER_ROOT = Path.home() / ".aside" / "u" / "0"
+DEFAULT_AGENT_ID = "main"
+SCRIPT_PATH = Path(__file__).resolve()
+BUNDLE_FORMAT = "aside-session-bundle"
+BUNDLE_SCHEMA = 2
+
+EXPORT_SESSION_FIELDS = (
+    "id", "agent_id", "parent_id", "branched_from", "title", "status",
+    "system_prompt", "model", "permission_mode", "permission", "context_window",
+    "cwd", "incognito", "created_at", "updated_at",
+)
+EXCLUDED_SESSION_FIELDS = {
+    "tool_state", "browser_binding", "active_tab_target_id", "queued_messages",
+    "steering_messages", "suspension", "runtime_config", "trigger",
+    "trigger_idempotency_key", "routine_id", "channel_route_key", "read_at",
+    "latest_compaction_message_offset", "ephemeral", "archived_at",
+}
+REQUIRED_LOCAL_COLUMNS = {
+    "sessions": {
+        "id", "agent_id", "branched_from", "title", "status", "cwd",
+        "queued_messages", "suspension", "tool_state", "active_tab_target_id",
+        "ephemeral", "read_at", "latest_compaction_message_offset", "archived_at",
+        "browser_binding",
+    },
+    "session_runs": {"id", "session_id", "jsonl_read_offset"},
+    "session_tabs": {"id", "session_id", "target_id"},
+    "agents": {"id"},
+}
+
+
+class SyncError(RuntimeError):
+    """A user-facing, safely recoverable sync failure."""
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def utc_now_epoch() -> int:
+    return int(dt.datetime.now(dt.timezone.utc).timestamp())
+
+
+def now_stamp() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def sanitize_device_id(value: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in "-_" else "-" for c in value.strip())
+    return cleaned.strip("-") or "device"
+
+
+def user_root(value: str | None) -> Path:
+    return Path(value).expanduser().resolve() if value else DEFAULT_USER_ROOT
+
+
+def sessions_root(root: Path, agent_id: str = DEFAULT_AGENT_ID) -> Path:
+    return root / "agents" / agent_id / "sessions"
+
+
+def session_dir_for(root: Path, sid: str, agent_id: str = DEFAULT_AGENT_ID) -> Path | None:
+    parent = sessions_root(root, agent_id)
+    if not parent.exists():
+        return None
+    matches = sorted(p for p in parent.iterdir() if p.is_dir() and p.name.endswith("_" + sid))
+    return matches[-1] if matches else None
+
+
+def connect_db(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(str(path), timeout=5.0)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
+
+
+def table_columns(con: sqlite3.Connection, table: str) -> list[str]:
+    return [str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")]
+
+
+def validate_local_schema(con: sqlite3.Connection) -> dict[str, list[str]]:
+    found = {}
+    for table, required in REQUIRED_LOCAL_COLUMNS.items():
+        cols = table_columns(con, table)
+        if not cols:
+            raise SyncError(f"local state.db is missing required table: {table}")
+        missing = required - set(cols)
+        if missing:
+            raise SyncError(f"local state.db table {table} is missing required columns: {', '.join(sorted(missing))}")
+        found[table] = cols
+    return found
+
+
+def sqlite_backup_connection(source: sqlite3.Connection, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    target = sqlite3.connect(str(destination))
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_jsonl(path: Path) -> int:
+    lines = 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                try:
+                    json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SyncError(f"invalid messages.jsonl JSON at line {number}: {exc}") from exc
+                lines += 1
+    except UnicodeDecodeError as exc:
+        raise SyncError(f"messages.jsonl is not valid UTF-8: {exc}") from exc
+    return lines
+
+
+def rand_id(length: int = 16) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
+
+
+def minimal_tool_state(cwd: Path) -> dict:
+    return {
+        "todo": {"todos": []},
+        "execution": {"totalRunMs": 0},
+        "bash": {"cwd": str(cwd)},
+        "skills": {},
+        "question": {},
+        "subagent": {"subagents": []},
+    }
+
+
+def write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def subprocess_checked(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            command, input=input_text, text=True, check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise SyncError(f"required encryption program is not installed: {command[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "command failed").strip()
+        raise SyncError(f"{command[0]} failed: {detail}") from exc
+
+
+def passphrase() -> str:
+    value = os.environ.get("ASIDE_SYNC_PASSPHRASE")
+    if not value:
+        raise SyncError("encryption passphrase missing; set ASIDE_SYNC_PASSPHRASE")
+    return value
+
+
+def encryption_for_path(path: Path, requested: str = "auto") -> str:
+    if requested != "auto":
+        return requested
+    if path.name.endswith(".tgz.age") or path.suffix == ".age":
+        return "age"
+    if path.name.endswith(".tgz.gpg") or path.suffix == ".gpg":
+        return "gpg"
+    if path.name.endswith(".tgz.enc") or path.suffix == ".enc":
+        return "openssl"
+    return "none"
+
+
+def encrypt_file(source: Path, destination: Path, backend: str, key_file: str | None, recipient: str | None) -> None:
+    if backend == "none":
+        shutil.copyfile(source, destination)
+    elif backend == "age":
+        if not recipient:
+            if not key_file:
+                raise SyncError("age encryption requires --age-recipient or --key-file")
+            result = subprocess_checked(["age-keygen", "-y", str(Path(key_file).expanduser())])
+            recipient = result.stdout.strip()
+        subprocess_checked(["age", "-e", "-r", recipient, "-o", str(destination), str(source)])
+    elif backend == "gpg":
+        subprocess_checked(
+            ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "0",
+             "--symmetric", "--cipher-algo", "AES256", "--output", str(destination), str(source)],
+            input_text=passphrase() + "\n",
+        )
+    elif backend == "openssl":
+        subprocess_checked(
+            ["openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2", "-iter", "600000",
+             "-pass", "stdin", "-in", str(source), "-out", str(destination)],
+            input_text=passphrase() + "\n",
+        )
+    else:
+        raise SyncError(f"unsupported encryption backend: {backend}")
+
+
+def decrypt_file(source: Path, destination: Path, backend: str, key_file: str | None) -> None:
+    if backend == "none":
+        shutil.copyfile(source, destination)
+    elif backend == "age":
+        if not key_file:
+            raise SyncError("age decryption requires --key-file")
+        subprocess_checked(["age", "-d", "-i", str(Path(key_file).expanduser()), "-o", str(destination), str(source)])
+    elif backend == "gpg":
+        subprocess_checked(
+            ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "0",
+             "--decrypt", "--output", str(destination), str(source)],
+            input_text=passphrase() + "\n",
+        )
+    elif backend == "openssl":
+        subprocess_checked(
+            ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "600000",
+             "-pass", "stdin", "-in", str(source), "-out", str(destination)],
+            input_text=passphrase() + "\n",
+        )
+    else:
+        raise SyncError(f"unsupported encryption backend: {backend}")
+
+
+def safe_member_name(name: str) -> None:
+    pure = PurePosixPath(name)
+    if pure.is_absolute() or ".." in pure.parts or not pure.parts or "\\" in name or "\x00" in name:
+        raise SyncError(f"unsafe bundle member path: {name}")
+
+
+def safe_component(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        raise SyncError(f"invalid {label}")
+    if "/" in value or "\\" in value or "\x00" in value or Path(value).name != value:
+        raise SyncError(f"unsafe {label}: {value!r}")
+    return value
+
+
+def extract_bundle(bundle: Path, destination: Path, encryption: str, key_file: str | None) -> tuple[dict, dict]:
+    plain = destination / "bundle.tgz"
+    backend = encryption_for_path(bundle, encryption)
+    decrypt_file(bundle, plain, backend, key_file)
+    try:
+        archive = tarfile.open(plain, "r:gz")
+    except (tarfile.TarError, OSError) as exc:
+        raise SyncError(f"invalid bundle archive: {bundle}") from exc
+    with archive:
+        members = archive.getmembers()
+        names = [member.name.rstrip("/") for member in members]
+        if len(names) != len(set(names)):
+            raise SyncError("bundle contains duplicate member names")
+        if any(PurePosixPath(name).name == "source-state.db" for name in names):
+            raise SyncError("v1 bundles are refused because they contain state.db; run scrub-v1")
+        for member in members:
+            safe_member_name(member.name)
+            if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                raise SyncError(f"unsupported bundle member type: {member.name}")
+            if member.isfile() and PurePosixPath(member.name).suffix.lower() == ".db":
+                raise SyncError(f"SQLite database members are forbidden: {member.name}")
+            target = destination / PurePosixPath(member.name)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SyncError(f"cannot read bundle member: {member.name}")
+                with target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            else:
+                raise SyncError(f"unsupported bundle member type: {member.name}")
+
+    manifest_path = destination / "manifest.json"
+    db_path = destination / "db.json"
+    if not manifest_path.exists():
+        raise SyncError("bundle missing manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SyncError(f"invalid manifest.json: {exc}") from exc
+    if manifest.get("format") == "aside-session-bundle-v1":
+        raise SyncError("v1 bundles are refused because they may expose credentials; run scrub-v1")
+    if manifest.get("format") != BUNDLE_FORMAT:
+        raise SyncError("unsupported bundle format")
+    version = manifest.get("schemaVersion")
+    if isinstance(version, int) and version > BUNDLE_SCHEMA:
+        raise SyncError(f"bundle schemaVersion {version} is newer than supported; upgrade aside-sync")
+    if version != BUNDLE_SCHEMA:
+        raise SyncError(f"unsupported bundle schemaVersion {version!r}; v2 is required")
+    session_id = safe_component(manifest.get("sessionId"), "manifest sessionId")
+    directory_name = safe_component(manifest.get("sessionDirName"), "manifest sessionDirName")
+    if not directory_name.endswith("_" + session_id):
+        raise SyncError("manifest sessionDirName must end with the session id")
+    if not db_path.exists():
+        raise SyncError("bundle missing db.json")
+    try:
+        db_data = json.loads(db_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SyncError(f"invalid db.json: {exc}") from exc
+
+    messages = destination / "files" / "messages.jsonl"
+    if not messages.exists():
+        raise SyncError("bundle missing files/messages.jsonl")
+    message_meta = manifest.get("messages") or {}
+    if messages.stat().st_size != message_meta.get("bytes"):
+        raise SyncError("messages.jsonl byte count mismatch")
+    if sha256_file(messages) != message_meta.get("sha256"):
+        raise SyncError("messages.jsonl sha256 mismatch")
+    lines = validate_jsonl(messages)
+    if lines != message_meta.get("lines"):
+        raise SyncError("messages.jsonl line count mismatch")
+
+    listed = set()
+    for item in manifest.get("files") or []:
+        rel = item.get("path")
+        if not isinstance(rel, str):
+            raise SyncError("manifest files entry has no path")
+        safe_member_name(rel)
+        if not (rel.startswith("files/artifacts/") or rel.startswith("files/attachments/")):
+            raise SyncError(f"manifest lists forbidden file path: {rel}")
+        if rel in listed:
+            raise SyncError(f"manifest lists a file more than once: {rel}")
+        path = destination / PurePosixPath(rel)
+        if not path.is_file():
+            raise SyncError(f"manifest-listed file is missing: {rel}")
+        if path.stat().st_size != item.get("bytes") or sha256_file(path) != item.get("sha256"):
+            raise SyncError(f"file validation failed: {rel}")
+        listed.add(rel)
+    actual_files = {
+        str(path.relative_to(destination)).replace(os.sep, "/")
+        for path in destination.rglob("*") if path.is_file()
+    }
+    actual_files.discard("bundle.tgz")
+    expected_files = {"manifest.json", "db.json", "files/messages.jsonl"} | listed
+    if actual_files != expected_files:
+        extras = sorted(actual_files - expected_files)
+        missing = sorted(expected_files - actual_files)
+        raise SyncError(f"bundle member list mismatch; extra={extras}, missing={missing}")
+    if not isinstance(db_data, dict) or not isinstance(db_data.get("session"), dict):
+        raise SyncError("db.json must contain one session object")
+    if not isinstance(db_data.get("runs"), list) or not isinstance(db_data.get("tabs"), list):
+        raise SyncError("db.json runs and tabs must be arrays")
+    if db_data["session"].get("id") != manifest.get("sessionId"):
+        raise SyncError("manifest and db.json session ids differ")
+    counts = manifest.get("dbCounts") or {}
+    if counts.get("runs") != len(db_data["runs"]) or counts.get("tabs") != len(db_data["tabs"]):
+        raise SyncError("manifest dbCounts do not match db.json")
+    return manifest, db_data
+
+
+def copy_selected_files(source_session: Path, build: Path, include_artifacts: bool, include_attachments: bool) -> list[dict]:
+    files_root = build / "files"
+    files_root.mkdir()
+    messages = source_session / "messages.jsonl"
+    shutil.copy2(messages, files_root / "messages.jsonl")
+    entries = []
+    selections = (("artifacts", include_artifacts), ("attachments", include_attachments))
+    for dirname, enabled in selections:
+        source_dir = source_session / dirname
+        if not enabled or not source_dir.exists():
+            continue
+        if source_dir.is_symlink():
+            raise SyncError(f"symlinked source directories are not allowed in bundles: {source_dir}")
+        for source in sorted(source_dir.rglob("*")):
+            if source.is_symlink():
+                raise SyncError(f"symlinks are not allowed in bundles: {source}")
+            if not source.is_file():
+                continue
+            relative = source.relative_to(source_dir)
+            target = files_root / dirname / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            archive_path = "files/" + dirname + "/" + str(relative).replace(os.sep, "/")
+            safe_member_name(archive_path)
+            entries.append({"path": archive_path, "bytes": target.stat().st_size, "sha256": sha256_file(target)})
+    return entries
+
+
+def export_bundle(args) -> None:
+    root = user_root(args.aside_root)
+    database = root / "state.db"
+    sid = safe_component(args.session_id, "session id")
+    agent_id = safe_component(args.agent_id, "agent id")
+    source_session = session_dir_for(root, sid, agent_id)
+    if not database.is_file():
+        raise SyncError(f"state.db not found: {database}")
+    if source_session is None:
+        raise SyncError(f"session folder not found for {sid}")
+    if source_session.is_symlink():
+        raise SyncError(f"symlinked session folders are not allowed: {source_session}")
+    messages = source_session / "messages.jsonl"
+    if not messages.is_file():
+        raise SyncError(f"messages.jsonl not found: {messages}")
+    if messages.is_symlink():
+        raise SyncError(f"symlinked messages.jsonl is not allowed: {messages}")
+    line_count = validate_jsonl(messages)
+
+    con = connect_db(database)
+    try:
+        columns = table_columns(con, "sessions")
+        missing = set(EXPORT_SESSION_FIELDS) - set(columns)
+        if missing:
+            raise SyncError(f"source sessions table missing export columns: {', '.join(sorted(missing))}")
+        row = con.execute(
+            f"SELECT {','.join(EXPORT_SESSION_FIELDS)} FROM sessions WHERE id=?", (sid,)
+        ).fetchone()
+        if row is None:
+            raise SyncError(f"source session row not found: {sid}")
+        session = dict(row)
+        if set(session) != set(EXPORT_SESSION_FIELDS) or EXCLUDED_SESSION_FIELDS & set(session):
+            raise SyncError("internal export whitelist invariant failed")
+        run_cols = [column for column in table_columns(con, "session_runs") if column != "id"]
+        tab_cols = table_columns(con, "session_tabs")
+        runs = [dict(r) for r in con.execute(
+            f"SELECT {','.join(run_cols)} FROM session_runs WHERE session_id=? ORDER BY id", (sid,)
+        )]
+        tabs = [dict(r) for r in con.execute(
+            f"SELECT {','.join(tab_cols)} FROM session_tabs WHERE session_id=? ORDER BY updated_at", (sid,)
+        )]
+    finally:
+        con.close()
+
+    output = Path(args.output).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    include_artifacts = not bool(getattr(args, "no_artifacts", False))
+    include_attachments = bool(getattr(args, "include_attachments", False))
+    source_device = sanitize_device_id(getattr(args, "source_device_id", None) or socket.gethostname())
+    encryption = getattr(args, "encryption", "none")
+    with tempfile.TemporaryDirectory(prefix="aside-sync-export-") as temporary:
+        build = Path(temporary) / "build"
+        build.mkdir()
+        file_entries = copy_selected_files(source_session, build, include_artifacts, include_attachments)
+        copied_messages = build / "files" / "messages.jsonl"
+        db_data = {"session": session, "runs": runs, "tabs": tabs}
+        write_json(build / "db.json", db_data)
+        manifest = {
+            "format": BUNDLE_FORMAT,
+            "schemaVersion": BUNDLE_SCHEMA,
+            "sessionId": sid,
+            "agentId": session.get("agent_id") or agent_id,
+            "sessionDirName": source_session.name,
+            "sourceDeviceId": source_device,
+            "exportedAt": utc_now_epoch(),
+            "title": session.get("title"),
+            "status": session.get("status"),
+            "createdAt": session.get("created_at"),
+            "updatedAt": session.get("updated_at"),
+            "messages": {
+                "bytes": copied_messages.stat().st_size,
+                "sha256": sha256_file(copied_messages),
+                "lines": line_count,
+            },
+            "files": file_entries,
+            "includes": {"artifacts": include_artifacts, "attachments": include_attachments},
+            "dbCounts": {"runs": len(runs), "tabs": len(tabs)},
+        }
+        write_json(build / "manifest.json", manifest)
+        plain = Path(temporary) / "bundle.tgz"
+        with tarfile.open(plain, "w:gz") as archive:
+            archive.add(build / "manifest.json", arcname="manifest.json")
+            archive.add(build / "db.json", arcname="db.json")
+            for path in sorted((build / "files").rglob("*")):
+                if path.is_file():
+                    archive.add(path, arcname=str(path.relative_to(build)).replace(os.sep, "/"))
+        staging_dir = output.parent / ".staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged = staging_dir / (output.name + "." + rand_id(8) + ".tmp")
+        try:
+            encrypt_file(plain, staged, encryption, getattr(args, "key_file", None), getattr(args, "age_recipient", None))
+            os.replace(staged, output)
+        finally:
+            if staged.exists():
+                staged.unlink()  # Our own incomplete staging artifact.
+    print(json.dumps({"bundle": str(output), **manifest}, ensure_ascii=False, indent=2))
+
+
+def backup_root_for(root: Path, override: str | None) -> Path:
+    if override:
+        return Path(override).expanduser().resolve()
+    # For ~/.aside/u/0 this is ~/.aside/backups; synthetic roots remain synthetic.
+    return root.parents[1] / "backups"
+
+
+def unique_destination(parent: Path, name: str) -> Path:
+    candidate = parent / name
+    index = 1
+    while candidate.exists():
+        candidate = parent / f"{name}.{index}"
+        index += 1
+    return candidate
+
+
+def move_to_trash(path: Path, trash_dir: Path | None = None) -> Path:
+    trash = trash_dir or (Path.home() / ".Trash")
+    trash.mkdir(parents=True, exist_ok=True)
+    target = unique_destination(trash, f"{path.name}.{now_stamp()}")
+    shutil.move(str(path), str(target))
+    return target
+
+
+def retain_backups(root: Path, trash_dir: Path | None) -> None:
+    backups = sorted((p for p in root.glob("aside-sync-import-*") if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[20:]:
+        move_to_trash(old, trash_dir)
+
+
+def insert_row(con: sqlite3.Connection, table: str, row: dict, local_columns: list[str], *, exclude: set[str] | None = None) -> None:
+    excluded = exclude or set()
+    use = [column for column in local_columns if column in row and column not in excluded]
+    if not use:
+        raise SyncError(f"no compatible columns for {table}")
+    placeholders = ",".join("?" for _ in use)
+    con.execute(f"INSERT INTO {table} ({','.join(use)}) VALUES ({placeholders})", [row.get(column) for column in use])
+
+
+def import_bundle(args) -> None:
+    root = user_root(args.aside_root)
+    database = root / "state.db"
+    bundle = Path(args.bundle).expanduser().resolve()
+    if not database.is_file():
+        raise SyncError(f"state.db not found: {database}")
+    if not bundle.is_file():
+        raise SyncError(f"bundle not found: {bundle}")
+    with tempfile.TemporaryDirectory(prefix="aside-sync-import-") as temporary:
+        extracted = Path(temporary) / "extracted"
+        extracted.mkdir()
+        manifest, db_data = extract_bundle(
+            bundle, extracted, getattr(args, "encryption", "auto"), getattr(args, "key_file", None)
+        )
+        original_sid = str(manifest["sessionId"])
+        requested_sid = getattr(args, "session_id", None)
+        if requested_sid and requested_sid != original_sid:
+            raise SyncError(f"bundle session id {original_sid} does not match requested {requested_sid}")
+        fork = bool(getattr(args, "as_new_session", False))
+        update = bool(getattr(args, "update_existing", False))
+        if fork and update:
+            raise SyncError("--as-new-session and --update-existing are mutually exclusive")
+        con = connect_db(database)
+        try:
+            columns = validate_local_schema(con)
+            source_session = db_data["session"]
+            agent_id = safe_component(
+                source_session.get("agent_id") or manifest.get("agentId") or DEFAULT_AGENT_ID,
+                "agent_id",
+            )
+            original_exists = con.execute("SELECT 1 FROM sessions WHERE id=?", (original_sid,)).fetchone() is not None
+            if fork:
+                while True:
+                    sid = rand_id()
+                    if (
+                        con.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone() is None
+                        and session_dir_for(root, sid, agent_id) is None
+                    ):
+                        break
+            else:
+                sid = original_sid
+            existing = con.execute("SELECT status FROM sessions WHERE id=?", (sid,)).fetchone()
+            if existing and existing["status"] == "running":
+                raise SyncError(f"refusing to overwrite running session: {sid}")
+            if existing and not update:
+                raise SyncError(f"destination session exists; use --update-existing: {sid}")
+            if con.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone() is None:
+                raise SyncError(f"bundle agent_id does not exist locally: {agent_id}")
+            unknown_session = sorted(set(source_session) - set(columns["sessions"]))
+            for field in unknown_session:
+                eprint(f"warning: ignoring bundle session field absent from local schema: {field}")
+            for bundle_name, table_name in (("runs", "session_runs"), ("tabs", "session_tabs")):
+                unknown = sorted({key for row in db_data[bundle_name] if isinstance(row, dict) for key in row} - set(columns[table_name]))
+                for field in unknown:
+                    eprint(f"warning: ignoring bundle {table_name} field absent from local schema: {field}")
+
+            destination_parent = sessions_root(root, agent_id)
+            dirname = f"{dt.date.today().isoformat()}_{sid}" if fork else str(manifest["sessionDirName"])
+            destination = destination_parent / dirname
+            existing_dir = session_dir_for(root, sid, agent_id)
+            if existing_dir and not update and not fork:
+                raise SyncError(f"destination session folder exists; use --update-existing: {existing_dir}")
+            incoming_size = (extracted / "files" / "messages.jsonl").stat().st_size
+            if existing_dir:
+                old_messages = existing_dir / "messages.jsonl"
+                if old_messages.exists() and old_messages.stat().st_size > incoming_size and not getattr(args, "force", False):
+                    raise SyncError("destination messages.jsonl is larger than source; use --force if intentional")
+                destination = existing_dir
+            backup_root = backup_root_for(root, getattr(args, "backup_root", None))
+            backup_dir = backup_root / f"aside-sync-import-{now_stamp()}-{sid}"
+            actions = [
+                {"action": "backup-db", "path": str(backup_dir / "state.db.before-import")},
+                {"action": "write-session-dir", "path": str(destination), "files": 1 + len(manifest.get("files") or [])},
+                {"action": "insert-session", "sessionId": sid, "updateExisting": bool(existing)},
+                {"action": "insert-runs", "count": len(db_data["runs"])},
+                {"action": "insert-tabs", "count": len(db_data["tabs"]), "preserveTargetId": True},
+            ]
+            if existing_dir:
+                actions.insert(1, {"action": "backup-session-dir", "path": str(existing_dir)})
+            if getattr(args, "dry_run", False):
+                print(json.dumps({"dryRun": True, "sessionId": sid, "actions": actions}, ensure_ascii=False, indent=2))
+                return
+
+            destination_parent.mkdir(parents=True, exist_ok=True)
+            stage_base = Path(tempfile.mkdtemp(prefix=".aside-sync-staging-", dir=destination_parent))
+            staged_session = stage_base / dirname
+            try:
+                shutil.copytree(extracted / "files", staged_session)
+            except Exception:
+                shutil.rmtree(stage_base)  # Disposable staging directory created by this process.
+                raise
+            backup_session = None
+            installed_destination = False
+            try:
+                con.execute("PRAGMA foreign_keys=ON")
+                # The SQLite backup API cannot make progress from a connection that
+                # already owns a write transaction.  Take the snapshot first, then
+                # immediately acquire the write lease and re-check live state before
+                # any mutation.
+                backup_dir.mkdir(parents=True, exist_ok=False)
+                try:
+                    sqlite_backup_connection(con, backup_dir / "state.db.before-import")
+                except sqlite3.OperationalError as exc:
+                    if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                        raise SyncError("state.db is locked; retry import later") from exc
+                    raise
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                        raise SyncError("state.db is locked; retry import later") from exc
+                    raise
+                current = con.execute("SELECT status FROM sessions WHERE id=?", (sid,)).fetchone()
+                if current and current["status"] == "running":
+                    raise SyncError(f"refusing to overwrite running session: {sid}")
+                if current and not update:
+                    raise SyncError(f"destination session exists; use --update-existing: {sid}")
+                if existing_dir:
+                    backup_session = unique_destination(backup_dir, existing_dir.name)
+                    shutil.move(str(existing_dir), str(backup_session))
+                os.replace(staged_session, destination)
+                installed_destination = True
+
+                if existing:
+                    con.execute("DELETE FROM session_runs WHERE session_id=?", (sid,))
+                    con.execute("DELETE FROM session_tabs WHERE session_id=?", (sid,))
+                    con.execute("DELETE FROM sessions WHERE id=?", (sid,))
+
+                session = {key: value for key, value in source_session.items() if key in EXPORT_SESSION_FIELDS}
+                session["id"] = sid
+                session["agent_id"] = agent_id
+                branch = source_session.get("branched_from")
+                if fork:
+                    session["branched_from"] = original_sid if original_exists else None
+                    suffix = getattr(args, "title_suffix", None)
+                    if suffix is None:
+                        suffix = f" (conflict from {manifest.get('sourceDeviceId') or 'unknown'})"
+                    session["title"] = str(source_session.get("title") or "") + suffix
+                elif branch and con.execute("SELECT 1 FROM sessions WHERE id=?", (branch,)).fetchone() is None:
+                    session["branched_from"] = None
+                session.update({
+                    "status": "idle",
+                    "cwd": str(destination),
+                    "queued_messages": "[]",
+                    "suspension": None,
+                    "active_tab_target_id": None,
+                    "browser_binding": None,
+                    "latest_compaction_message_offset": 0,
+                    "tool_state": json.dumps(minimal_tool_state(destination), ensure_ascii=False, separators=(",", ":")),
+                    "read_at": utc_now_epoch(),
+                    "ephemeral": 0,
+                    "archived_at": None,
+                })
+                insert_row(con, "sessions", session, columns["sessions"])
+
+                for source_run in db_data["runs"]:
+                    if not isinstance(source_run, dict):
+                        raise SyncError("db.json run entries must be objects")
+                    run_row = dict(source_run)
+                    run_row["session_id"] = sid
+                    insert_row(con, "session_runs", run_row, columns["session_runs"], exclude={"id"})
+
+                for source_tab in db_data["tabs"]:
+                    if not isinstance(source_tab, dict) or not source_tab.get("target_id"):
+                        raise SyncError("db.json tab entries must be objects with target_id")
+                    tab = dict(source_tab)
+                    tab["session_id"] = sid
+                    tab_id = tab.get("id") or rand_id()
+                    while con.execute("SELECT 1 FROM session_tabs WHERE id=?", (tab_id,)).fetchone():
+                        tab_id = rand_id()
+                    tab["id"] = tab_id
+                    insert_row(con, "session_tabs", tab, columns["session_tabs"])
+                con.commit()
+            except Exception:
+                con.rollback()
+                if installed_destination and destination.exists():
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    failed = unique_destination(backup_dir, f"failed-import-{destination.name}")
+                    shutil.move(str(destination), str(failed))
+                if backup_session and backup_session.exists():
+                    shutil.move(str(backup_session), str(destination))
+                raise
+            finally:
+                if stage_base.exists():
+                    shutil.rmtree(stage_base)  # Disposable staging directory created by this process.
+        finally:
+            con.close()
+        trash_arg = getattr(args, "trash_dir", None)
+        retain_backups(backup_root, Path(trash_arg).expanduser().resolve() if trash_arg else None)
+    print(json.dumps({
+        "imported": sid,
+        "sourceSessionId": original_sid,
+        "mode": "fork" if fork else ("update" if existing else "insert"),
+        "sessionDir": str(destination),
+        "runs": len(db_data["runs"]),
+        "tabs": len(db_data["tabs"]),
+        "backupDir": str(backup_dir),
+        "sidebarSafe": True,
+    }, ensure_ascii=False, indent=2))
+
+
+def inspect_bundle(args) -> None:
+    bundle = Path(args.bundle).expanduser().resolve()
+    if not bundle.is_file():
+        raise SyncError(f"bundle not found: {bundle}")
+    with tempfile.TemporaryDirectory(prefix="aside-sync-inspect-") as temporary:
+        destination = Path(temporary)
+        manifest, _ = extract_bundle(bundle, destination, args.encryption, args.key_file)
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
+def is_v1_bundle(path: Path) -> bool:
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            names = {member.name.rstrip("/") for member in archive.getmembers()}
+            if any(PurePosixPath(name).name == "source-state.db" for name in names):
+                return True
+            handle = archive.extractfile("manifest.json")
+            if handle:
+                manifest = json.loads(handle.read().decode("utf-8"))
+                return manifest.get("format") == "aside-session-bundle-v1"
+    except (tarfile.TarError, OSError, json.JSONDecodeError, UnicodeDecodeError, KeyError):
+        return False
+    return False
+
+
+def scrub_v1(args) -> None:
+    sync_dir = Path(args.sync_dir).expanduser().resolve()
+    if not sync_dir.exists():
+        raise SyncError(f"sync directory not found: {sync_dir}")
+    trash = Path(args.trash_dir).expanduser().resolve() if args.trash_dir else Path.home() / ".Trash"
+    matches = []
+    for path in sorted(p for p in sync_dir.rglob("*") if p.is_file()):
+        if is_v1_bundle(path):
+            matches.append(path)
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "found": len(matches), "bundles": [str(p) for p in matches]}, indent=2))
+        return
+    moved = []
+    for path in matches:
+        moved.append(str(move_to_trash(path, trash)))
+    print(json.dumps({"found": len(matches), "moved": len(moved), "trashPaths": moved}, ensure_ascii=False, indent=2))
+
+
+def list_sessions(root: Path, limit: int) -> list[dict]:
+    database = root / "state.db"
+    if not database.is_file():
+        raise SyncError(f"state.db not found: {database}")
+    con = connect_db(database)
+    try:
+        return [dict(row) for row in con.execute(
+            "SELECT id,title,status,created_at,updated_at,archived_at,ephemeral "
+            "FROM sessions WHERE archived_at IS NULL AND ephemeral=0 ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        )]
+    finally:
+        con.close()
+
+
+def status(args) -> None:
+    rows = list_sessions(user_root(args.aside_root), args.limit)
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
+def shell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def remote_temp(remote: str) -> str:
+    result = subprocess_checked(["ssh", remote, "mktemp -d /tmp/aside-sync.XXXXXX"])
+    return result.stdout.strip()
+
+
+def remote_cleanup(remote: str, temporary: str) -> None:
+    command = f"mkdir -p ~/.Trash && mv {shell_quote(temporary)} ~/.Trash/{shell_quote(Path(temporary).name + '.' + now_stamp())}"
+    subprocess.run(["ssh", remote, command], check=False)
+
+
+def pull(args) -> None:
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "actions": ["create remote bundle", "copy bundle locally", "validate and import"]}, indent=2))
+        return
+    with tempfile.TemporaryDirectory(prefix="aside-sync-pull-") as temporary:
+        local_bundle = Path(temporary) / "bundle.tgz"
+        remote_dir = remote_temp(args.remote)
+        try:
+            subprocess_checked(["scp", str(SCRIPT_PATH), f"{args.remote}:{remote_dir}/aside-sync"])
+            command = (
+                f"python3 {shell_quote(remote_dir + '/aside-sync')} --aside-root {shell_quote(args.remote_aside_root)} "
+                f"export-bundle {shell_quote(args.session_id)} --output {shell_quote(remote_dir + '/bundle.tgz')}"
+            )
+            subprocess_checked(["ssh", args.remote, command])
+            subprocess_checked(["scp", f"{args.remote}:{remote_dir}/bundle.tgz", str(local_bundle)])
+            forwarded = argparse.Namespace(**vars(args), bundle=str(local_bundle), session_id=args.session_id,
+                                           as_new_session=False, title_suffix=None, encryption="auto", key_file=None,
+                                           backup_root=None, trash_dir=None)
+            import_bundle(forwarded)
+        finally:
+            remote_cleanup(args.remote, remote_dir)
+
+
+def push(args) -> None:
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "actions": ["build local bundle", "copy bundle remotely", "validate and import"]}, indent=2))
+        return
+    with tempfile.TemporaryDirectory(prefix="aside-sync-push-") as temporary:
+        local_bundle = Path(temporary) / "bundle.tgz"
+        export_args = argparse.Namespace(**vars(args), output=str(local_bundle), source_device_id=socket.gethostname(),
+                                         no_artifacts=False, include_attachments=False, encryption="none",
+                                         key_file=None, age_recipient=None)
+        export_bundle(export_args)
+        remote_dir = remote_temp(args.remote)
+        try:
+            subprocess_checked(["scp", str(SCRIPT_PATH), f"{args.remote}:{remote_dir}/aside-sync"])
+            subprocess_checked(["scp", str(local_bundle), f"{args.remote}:{remote_dir}/bundle.tgz"])
+            flags = " --update-existing" if args.update_existing else ""
+            flags += " --force" if args.force else ""
+            command = (
+                f"python3 {shell_quote(remote_dir + '/aside-sync')} --aside-root {shell_quote(args.remote_aside_root)} "
+                f"import-bundle {shell_quote(remote_dir + '/bundle.tgz')}{flags}"
+            )
+            subprocess_checked(["ssh", args.remote, command])
+        finally:
+            remote_cleanup(args.remote, remote_dir)
+
+
+def add_decrypt_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--encryption", choices=("auto", "none", "age", "gpg", "openssl"), default="auto")
+    parser.add_argument("--key-file")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Secure Aside session sync engine")
+    parser.add_argument("--aside-root", default=str(DEFAULT_USER_ROOT))
+    parser.add_argument("--agent-id", default=DEFAULT_AGENT_ID)
+    commands = parser.add_subparsers(dest="cmd", required=True)
+
+    command = commands.add_parser("status")
+    command.add_argument("--limit", type=int, default=30)
+    command.set_defaults(func=status)
+
+    command = commands.add_parser("export-bundle")
+    command.add_argument("session_id")
+    command.add_argument("--output", required=True)
+    command.add_argument("--source-device-id")
+    command.add_argument("--no-artifacts", action="store_true")
+    command.add_argument("--include-attachments", action="store_true")
+    command.add_argument("--encryption", choices=("none", "age", "gpg", "openssl"), default="none")
+    command.add_argument("--key-file")
+    command.add_argument("--age-recipient")
+    command.set_defaults(func=export_bundle)
+
+    command = commands.add_parser("import-bundle")
+    command.add_argument("bundle")
+    command.add_argument("--session-id")
+    command.add_argument("--update-existing", action="store_true")
+    command.add_argument("--as-new-session", action="store_true")
+    command.add_argument("--title-suffix")
+    command.add_argument("--force", action="store_true")
+    command.add_argument("--dry-run", action="store_true")
+    command.add_argument("--backup-root", help=argparse.SUPPRESS)
+    command.add_argument("--trash-dir", help=argparse.SUPPRESS)
+    add_decrypt_options(command)
+    command.set_defaults(func=import_bundle)
+
+    command = commands.add_parser("inspect-bundle")
+    command.add_argument("bundle")
+    add_decrypt_options(command)
+    command.set_defaults(func=inspect_bundle)
+
+    command = commands.add_parser("scrub-v1")
+    command.add_argument("sync_dir")
+    command.add_argument("--dry-run", action="store_true")
+    command.add_argument("--trash-dir")
+    command.set_defaults(func=scrub_v1)
+
+    for name, function in (("pull", pull), ("push", push)):
+        command = commands.add_parser(name)
+        command.add_argument("remote")
+        command.add_argument("session_id")
+        command.add_argument("--remote-aside-root", default=str(DEFAULT_USER_ROOT))
+        command.add_argument("--update-existing", action="store_true")
+        command.add_argument("--force", action="store_true")
+        command.add_argument("--dry-run", action="store_true")
+        command.set_defaults(func=function)
+    return parser
+
+
+def main(argv=None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+        args.func(args)
+        return 0
+    except (SyncError, sqlite3.Error, OSError) as exc:
+        eprint(f"error: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

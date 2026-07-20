@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import getpass
 import hashlib
 import json
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 
@@ -49,12 +51,27 @@ def valid_sync_id(value: object) -> bool:
     return isinstance(value, str) and bool(value) and all(c.isalnum() or c in "-_" for c in value)
 
 
+def nudge_cloud_download(path: Path) -> None:
+    # macOS-only: launchd agents cannot implicitly materialize dataless cloud
+    # files (reads fail with EDEADLK); ask FileProvider to download explicitly.
+    if sys.platform == "darwin":
+        subprocess.run(["brctl", "download", str(path)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 def load_json(path: Path, default):
     path = path.expanduser()
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            if exc.errno != errno.EDEADLK:
+                raise
+            nudge_cloud_download(path)
+            time.sleep(1)
+            return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise DaemonError(f"invalid JSON file {path}: {exc}") from exc
 
@@ -441,7 +458,11 @@ def export_sessions(config: dict, state: dict, *, dry_run: bool = False, force_s
         force = sid in force_sids
         if not force and session_state.get("lastExportedHash") == message_hash:
             continue
-        current = read_lock(sync_dir, sid)
+        try:
+            current = read_lock(sync_dir, sid)
+        except OSError as exc:
+            skipped.append({"sessionId": sid, "reason": "lock-unreadable", "error": str(exc)[:120]})
+            continue
         current_time = now_epoch()
         grace = int(locks.get("graceSeconds", 120))
         foreign = bool(current and current.get("ownerDeviceId") != device and int(current.get("leaseUntil") or 0) >= current_time - grace)
@@ -513,27 +534,35 @@ def write_index(config: dict, index: dict) -> Path:
     return final
 
 
-def read_indexes(config: dict) -> list[tuple[Path, dict]]:
+def read_indexes(config: dict) -> tuple[list[tuple[Path, dict]], list[str]]:
     directory = Path(config["syncDir"]).expanduser() / "indexes"
     if not directory.exists():
-        return []
+        return [], []
     results = []
+    unreadable = []
     for path in sorted(directory.glob("*.json*")):
         if path.name.endswith(".tmp"):
             continue
-        if path.suffix == ".json":
-            data = load_json(path, {})
-        else:
-            expected = suffix_for((config.get("security") or {}).get("encryption", "none"))
-            if not expected or not path.name.endswith(expected):
-                continue
-            with tempfile.TemporaryDirectory(prefix="aside-sync-index-read-") as temporary:
-                plain = Path(temporary) / "index.json"
-                crypt_index(config, path, plain, decrypt=True)
-                data = load_json(plain, {})
-        if data.get("schemaVersion") == INDEX_SCHEMA:
+        try:
+            data = read_one_index(config, path)
+        except OSError:
+            unreadable.append(path.name)
+            continue
+        if data is not None and data.get("schemaVersion") == INDEX_SCHEMA:
             results.append((path, data))
-    return results
+    return results, unreadable
+
+
+def read_one_index(config: dict, path: Path) -> dict | None:
+    if path.suffix == ".json":
+        return load_json(path, {})
+    expected = suffix_for((config.get("security") or {}).get("encryption", "none"))
+    if not expected or not path.name.endswith(expected):
+        return None
+    with tempfile.TemporaryDirectory(prefix="aside-sync-index-read-") as temporary:
+        plain = Path(temporary) / "index.json"
+        crypt_index(config, path, plain, decrypt=True)
+        return load_json(plain, {})
 
 
 def find_bundle(config: dict, sid: str, source: str, remote_hash: str) -> Path | None:
@@ -592,7 +621,10 @@ def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[
     local_device = config["deviceId"]
     local_map = {row["id"]: row for row in local_sessions(config)}
     imported, skipped, conflicts, planned = [], [], [], []
-    for _, index in read_indexes(config):
+    indexes, unreadable = read_indexes(config)
+    for name in unreadable:
+        skipped.append({"sessionId": None, "reason": "index-unreadable", "index": name})
+    for _, index in indexes:
         source = index.get("deviceId")
         if not source or source == local_device:
             continue
@@ -623,6 +655,10 @@ def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[
                 skipped.append({"sessionId": sid, "reason": "local-running", "sourceDeviceId": source})
                 continue
             last_imported = session_state.get("lastImportedHash")
+            if local and last_imported == remote_hash:
+                # Remote still advertises the version we already imported and
+                # local has moved on; nothing new to pull for this session.
+                continue
             diverged = bool(local and (last_imported is None or (local_hash != last_imported and remote_hash != last_imported)))
             if diverged:
                 if dry_run:
@@ -630,16 +666,26 @@ def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[
                     continue
                 path, record = record_conflict(config, sid, source, local_hash, remote_hash, bundle)
                 if config.get("conflictPolicy") == "fork" and record.get("resolution") is None:
-                    result = import_operation(config, bundle, "--session-id", sid, "--as-new-session")
-                    record["resolution"] = f"forked:{result['imported']}"
-                    save_json(path, record)
+                    nudge_cloud_download(bundle)
+                    try:
+                        result = import_operation(config, bundle, "--session-id", sid, "--as-new-session")
+                    except (DaemonError, OSError, subprocess.CalledProcessError) as exc:
+                        skipped.append({"sessionId": sid, "reason": "fork-import-failed", "sourceDeviceId": source, "error": str(exc)[:200]})
+                    else:
+                        record["resolution"] = f"forked:{result['imported']}"
+                        save_json(path, record)
                 conflicts.append(record)
                 continue
             flags = ("--session-id", sid, "--update-existing") if local else ("--session-id", sid)
             if dry_run:
                 planned.append({"action": "import", "sessionId": sid, "sourceDeviceId": source, "updateExisting": bool(local)})
                 continue
-            result = import_operation(config, bundle, *flags)
+            nudge_cloud_download(bundle)
+            try:
+                result = import_operation(config, bundle, *flags)
+            except (DaemonError, OSError, subprocess.CalledProcessError) as exc:
+                skipped.append({"sessionId": sid, "reason": "import-failed", "sourceDeviceId": source, "error": str(exc)[:200]})
+                continue
             session_state["lastImportedHash"] = remote_hash
             session_state["lastExportedHash"] = remote_hash
             session_state.setdefault("imports", {})[source] = {"hash": remote_hash, "importedAt": now_epoch()}
@@ -798,7 +844,8 @@ def status(args) -> None:
     sync_dir = Path(config["syncDir"]).expanduser()
     state, _ = load_state(Path(args.state).expanduser())
     indexes = []
-    for _, index in read_indexes(config):
+    readable, _unreadable = read_indexes(config)
+    for _, index in readable:
         indexes.append({"deviceId": index.get("deviceId"), "heartbeatAt": index.get("heartbeatAt"), "sessions": len(index.get("sessions") or [])})
     conflicts = []
     conflict_dir = sync_dir / "conflicts"
@@ -1250,6 +1297,7 @@ def main(argv=None) -> int:
         return 0
     except (DaemonError, OSError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return 1
 
 

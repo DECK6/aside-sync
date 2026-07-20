@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import runpy
 import shutil
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.common import SYNC, SYNCD, create_fixture, daemon_config, empty_target, run_cli
 
@@ -77,6 +80,30 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(result["dryRun"])
         after = sorted(str(p.relative_to(self.base)) for p in self.base.rglob("*"))
         self.assertEqual(before, after)
+
+    def test_load_json_retries_dataless_cloud_read_with_brctl_nudge(self):
+        api = runpy.run_path(str(SYNCD))
+        target = Path(self.tmp.name) / "lock.json"
+        target.write_text('{"ok": true}', encoding="utf-8")
+        deadlock = OSError(errno.EDEADLK, "Resource deadlock avoided")
+        nudged = []
+        real_read_text = Path.read_text
+        reads = {"n": 0}
+
+        def flaky_read_text(path_self, *args, **kwargs):
+            if path_self == target and reads["n"] == 0:
+                reads["n"] += 1
+                raise deadlock
+            return real_read_text(path_self, *args, **kwargs)
+
+        with mock.patch.dict(api["load_json"].__globals__, {
+            "nudge_cloud_download": lambda p: nudged.append(p),
+            "time": mock.Mock(sleep=lambda s: None),
+        }):
+            with mock.patch.object(Path, "read_text", flaky_read_text):
+                data = api["load_json"](target, None)
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(nudged, [target])
 
     def test_log_rotates_at_five_megabytes(self):
         config = json.loads(self.config_a.read_text())

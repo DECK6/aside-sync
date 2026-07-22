@@ -27,6 +27,15 @@ users" is enabled under System Settings → General → Sharing → Remote Login
 This affects only commands run over SSH; the daemon running locally on the
 device is unaffected.
 
+Note for LaunchAgent mode with an iCloud (or otherwise TCC-protected) sync
+folder: the launchd-spawned python has no interactive TCC context, so macOS
+may silently deny it ("Operation not permitted") or fail dataless-file reads
+with EDEADLK. Grant Full Disk Access to the exact python binary recorded in
+the generated plist (System Settings → Privacy & Security → Full Disk Access
+→ +). Trade-off: every script run by that interpreter then has full-disk
+read access. The daemon requests dataless downloads via `brctl download` and
+skips still-unreadable files until the next cycle instead of crashing.
+
 ## Install and set up
 
 Run `./install.sh` to copy the two executables to `~/.aside/tools/`. Existing

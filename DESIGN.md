@@ -18,24 +18,28 @@ requirements, not polish.
   - `state.db` (SQLite, WAL mode — `-wal`/`-shm` present)
   - `credentials.json`, `passwords/`, `settings.json`, `models.json`,
     `suggested-items/` — **must never enter a bundle or the sync dir**
-  - sessions: `~/.aside/u/0/agents/<agentId>/sessions/<date>_<sessionId>/`
-    containing `messages.jsonl`, `artifacts/`, `tmp/`, sometimes `attachments/`
-- `state.db` tables: `agents, channel_connections, channel_pairing_requests,
-  inbox_messages, notification_grants, routines, sessions, session_runs,
-  session_tabs`. Only the last three are sync-relevant.
+  - current sessions: `~/.aside/u/0/sessions/<date>_<sessionId>/`
+  - legacy sessions: `~/.aside/u/0/agents/<agentId>/sessions/<date>_<sessionId>/`
+    Both layouts contain `messages.jsonl`, `artifacts/`, `tmp/`, and sometimes
+    `attachments/`. The local DB schema determines which layout is authoritative.
+- Current `state.db` no longer has an `agents` table or `sessions.agent_id`;
+  legacy databases may have both. Other tables include
+  `channel_connections, channel_pairing_requests, inbox_messages,
+  notification_grants, routines, sessions, session_runs, session_tabs`.
+  Only the last three are sync-relevant.
   `channel_connections` holds live bot tokens — this is why shipping the whole
   DB in a bundle (MVP v1 behavior) is a real credential leak.
 
-### Verified schema (2026-07-20)
+### Verified schemas (legacy 2026-07-20, current 2026-07-29)
 
-`sessions` columns:
-`id, agent_id, parent_id, branched_from, title, trigger,
-trigger_idempotency_key, routine_id, channel_route_key, status, system_prompt,
-model, permission_mode, permission, context_window, queued_messages,
-steering_messages, cwd, suspension, tool_state, active_tab_target_id,
-incognito, ephemeral, runtime_config, read_at,
-latest_compaction_message_offset, archived_at, created_at, updated_at,
-browser_binding`
+Common `sessions` columns:
+`id, parent_id, branched_from, title, trigger, trigger_idempotency_key,
+routine_id, channel_route_key, status, system_prompt, model, permission_mode,
+permission, context_window, queued_messages, steering_messages, cwd,
+suspension, tool_state, active_tab_target_id, incognito, ephemeral,
+runtime_config, read_at, latest_compaction_message_offset, archived_at,
+created_at, updated_at, browser_binding`. Legacy databases also contain
+`agent_id`; current databases instead may contain `project_id`.
 
 `session_runs` columns:
 `id (autoincrement), session_id, user_message, final_assistant_message,
@@ -139,9 +143,10 @@ inside. Ever.**
 ### db.json — whitelist export, not blacklist
 
 `sessions` row: export ONLY these fields (`EXPORT_SESSION_FIELDS`):
-`id, agent_id, parent_id, branched_from, title, status, system_prompt, model,
+`id, parent_id, branched_from, title, status, system_prompt, model,
 permission_mode, permission, context_window, cwd, incognito, created_at,
-updated_at`
+updated_at`, plus `agent_id` only when the local legacy schema contains it.
+`manifest.agentId` remains present as the compatibility bridge.
 
 Everything else is deliberately absent — including `tool_state`,
 `browser_binding`, `active_tab_target_id`, `queued_messages`,
@@ -166,8 +171,10 @@ hijack a channel route or routine on the target device.
 - Forced local values on insert (`IMPORT_FORCED_FIELDS`) — see §0 landmines,
   plus: `cwd = <dest session dir>`, `read_at = now`, `ephemeral = 0`,
   `archived_at = NULL`. Columns not provided rely on schema defaults.
-- FK safety: `agent_id` must exist in local `agents` (else fail with clear
-  message); `branched_from` nulled if referent absent locally.
+- FK safety: when the destination has legacy `sessions.agent_id`, `agent_id`
+  must exist in local `agents` (else fail with a clear message). Current
+  agentless destinations ignore the optional bundle field. `branched_from` is
+  nulled if its referent is absent locally.
 - `session_runs`: insert without `id`; the UNIQUE `(session_id,
   jsonl_read_offset)` index is satisfied because update-existing deletes rows
   first.

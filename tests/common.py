@@ -31,28 +31,66 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def create_fixture(base: Path, sid: str = "sessionABC123456", *, status: str = "idle") -> Path:
+def session_directory(root: Path, sid: str, agent_id: str = "main") -> Path | None:
+    for parent in (root / "sessions", root / "agents" / agent_id / "sessions"):
+        if not parent.exists():
+            continue
+        matches = sorted(parent.glob(f"*_{sid}"))
+        if matches:
+            return matches[-1]
+    return None
+
+
+def create_fixture(
+    base: Path, sid: str = "sessionABC123456", *, status: str = "idle", schema: str = "legacy",
+) -> Path:
+    if schema not in ("legacy", "current"):
+        raise ValueError(f"unsupported fixture schema: {schema}")
     root = base / "aside" / "u" / "0"
     root.mkdir(parents=True)
     db = root / "state.db"
     con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=WAL")
+    if schema == "legacy":
+        con.executescript(
+            """
+            CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT);
+            CREATE TABLE sessions (
+              id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, parent_id TEXT,
+              branched_from TEXT, title TEXT, trigger TEXT,
+              trigger_idempotency_key TEXT, routine_id TEXT, channel_route_key TEXT,
+              status TEXT, system_prompt TEXT, model TEXT, permission_mode TEXT,
+              permission TEXT, context_window INTEGER, queued_messages TEXT,
+              steering_messages TEXT, cwd TEXT, suspension TEXT, tool_state TEXT,
+              active_tab_target_id TEXT, incognito INTEGER DEFAULT 0,
+              ephemeral INTEGER DEFAULT 0, runtime_config TEXT, read_at INTEGER,
+              latest_compaction_message_offset INTEGER DEFAULT 0, archived_at INTEGER,
+              created_at INTEGER, updated_at INTEGER, browser_binding TEXT,
+              FOREIGN KEY(agent_id) REFERENCES agents(id)
+            );
+            """
+        )
+        con.execute("INSERT INTO agents VALUES ('main','Main')")
+    else:
+        con.executescript(
+            """
+            CREATE TABLE sessions (
+              id TEXT PRIMARY KEY, parent_id TEXT, branched_from TEXT, title TEXT,
+              trigger TEXT, trigger_idempotency_key TEXT, routine_id TEXT,
+              channel_route_key TEXT, status TEXT, system_prompt TEXT, model TEXT,
+              permission_mode TEXT, permission TEXT, context_window TEXT,
+              queued_messages TEXT, steering_messages TEXT, cwd TEXT,
+              suspension TEXT, tool_state TEXT, active_tab_target_id TEXT,
+              incognito INTEGER DEFAULT 0, ephemeral INTEGER DEFAULT 0,
+              runtime_config TEXT, read_at INTEGER,
+              latest_compaction_message_offset INTEGER DEFAULT 0, archived_at INTEGER,
+              created_at INTEGER, updated_at INTEGER, browser_binding TEXT,
+              project_id TEXT
+            );
+            """
+        )
     con.executescript(
         """
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT);
-        CREATE TABLE sessions (
-          id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, parent_id TEXT,
-          branched_from TEXT, title TEXT, trigger TEXT,
-          trigger_idempotency_key TEXT, routine_id TEXT, channel_route_key TEXT,
-          status TEXT, system_prompt TEXT, model TEXT, permission_mode TEXT,
-          permission TEXT, context_window INTEGER, queued_messages TEXT,
-          steering_messages TEXT, cwd TEXT, suspension TEXT, tool_state TEXT,
-          active_tab_target_id TEXT, incognito INTEGER DEFAULT 0,
-          ephemeral INTEGER DEFAULT 0, runtime_config TEXT, read_at INTEGER,
-          latest_compaction_message_offset INTEGER DEFAULT 0, archived_at INTEGER,
-          created_at INTEGER, updated_at INTEGER, browser_binding TEXT,
-          FOREIGN KEY(agent_id) REFERENCES agents(id)
-        );
         CREATE TABLE session_runs (
           id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,
           user_message TEXT, final_assistant_message TEXT, files_changed TEXT,
@@ -71,25 +109,27 @@ def create_fixture(base: Path, sid: str = "sessionABC123456", *, status: str = "
         CREATE TABLE channel_connections (id TEXT, bot_token TEXT);
         """
     )
-    con.execute("INSERT INTO agents VALUES ('main','Main')")
+    session = {
+        "id": sid, "parent_id": None, "branched_from": None, "title": "Fixture session",
+        "trigger": "secret-trigger", "trigger_idempotency_key": "secret-idempotency",
+        "routine_id": "routine-secret", "channel_route_key": "channel-secret", "status": status,
+        "system_prompt": "system", "model": "model-x", "permission_mode": "default",
+        "permission": "ask", "context_window": 100000, "queued_messages": '["queued-secret"]',
+        "steering_messages": '["steering-secret"]', "cwd": "/source/path",
+        "suspension": "suspended-secret", "tool_state": '{"sensitive":"tool-state"}',
+        "active_tab_target_id": "tab:live", "incognito": 0, "ephemeral": 0,
+        "runtime_config": '{"secret":"runtime"}', "read_at": 111,
+        "latest_compaction_message_offset": 99, "archived_at": None,
+        "created_at": 1000, "updated_at": 2000, "browser_binding": '{"live":"browser"}',
+    }
+    if schema == "legacy":
+        session = {"id": session.pop("id"), "agent_id": "main", **session}
+    else:
+        session["project_id"] = None
+    fields = list(session)
     con.execute(
-        """INSERT INTO sessions (
-          id,agent_id,parent_id,branched_from,title,trigger,trigger_idempotency_key,
-          routine_id,channel_route_key,status,system_prompt,model,permission_mode,
-          permission,context_window,queued_messages,steering_messages,cwd,
-          suspension,tool_state,active_tab_target_id,incognito,ephemeral,
-          runtime_config,read_at,latest_compaction_message_offset,archived_at,
-          created_at,updated_at,browser_binding
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            sid, "main", None, None, "Fixture session", "secret-trigger",
-            "secret-idempotency", "routine-secret", "channel-secret", status,
-            "system", "model-x", "default", "ask", 100000, '["queued-secret"]',
-            '["steering-secret"]', "/source/path", "suspended-secret",
-            '{"sensitive":"tool-state"}', "tab:live", 0, 0,
-            '{"secret":"runtime"}', 111, 99, None, 1000, 2000,
-            '{"live":"browser"}',
-        ),
+        f"INSERT INTO sessions ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})",
+        [session[field] for field in fields],
     )
     con.execute(
         """INSERT INTO session_runs
@@ -107,7 +147,8 @@ def create_fixture(base: Path, sid: str = "sessionABC123456", *, status: str = "
     con.commit()
     con.close()
 
-    sdir = root / "agents" / "main" / "sessions" / f"2026-07-20_{sid}"
+    parent = root / "agents" / "main" / "sessions" if schema == "legacy" else root / "sessions"
+    sdir = parent / f"2026-07-20_{sid}"
     (sdir / "artifacts").mkdir(parents=True)
     (sdir / "attachments").mkdir()
     (sdir / "tmp").mkdir()
@@ -123,15 +164,15 @@ def create_fixture(base: Path, sid: str = "sessionABC123456", *, status: str = "
     return root
 
 
-def empty_target(base: Path) -> Path:
-    root = create_fixture(base, sid="placeholder00000")
+def empty_target(base: Path, *, schema: str = "legacy") -> Path:
+    root = create_fixture(base, sid="placeholder00000", schema=schema)
     con = sqlite3.connect(root / "state.db")
     con.execute("DELETE FROM session_runs")
     con.execute("DELETE FROM session_tabs")
     con.execute("DELETE FROM sessions")
     con.commit()
     con.close()
-    sessions = root / "agents" / "main" / "sessions"
+    sessions = root / "agents" / "main" / "sessions" if schema == "legacy" else root / "sessions"
     for child in sessions.iterdir():
         # Test fixtures are disposable tempfile data.
         import shutil
@@ -153,7 +194,9 @@ def db_snapshot(root: Path):
         rows[table] = con.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
     con.close()
     files = {}
-    sessions = root / "agents" / "main" / "sessions"
+    sessions = root / "sessions"
+    if not sessions.exists():
+        sessions = root / "agents" / "main" / "sessions"
     if sessions.exists():
         for path in sorted(p for p in sessions.rglob("*") if p.is_file()):
             files[str(path.relative_to(root))] = path.read_bytes()
@@ -198,7 +241,9 @@ def daemon_config(path: Path, root: Path, sync_dir: Path, device: str, *, policy
 
 
 def append_message(root: Path, sid: str, marker: str) -> str:
-    sdir = next((root / "agents" / "main" / "sessions").glob(f"*_{sid}"))
+    sdir = session_directory(root, sid)
+    if sdir is None:
+        raise FileNotFoundError(f"session directory not found: {sid}")
     with (sdir / "messages.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"role": "user", "content": marker}) + "\n")
     con = sqlite3.connect(root / "state.db")

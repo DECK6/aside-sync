@@ -56,6 +56,56 @@ class DaemonTests(unittest.TestCase):
         self.assertGreater(index["heartbeatAt"], 0)
         self.assertFalse(any(self.shared.rglob("*.tmp")))
 
+    def test_current_schema_round_trip_without_legacy_symlink(self):
+        root_a = create_fixture(self.base / "current-a", SID, schema="current")
+        root_b = empty_target(self.base / "current-b", schema="current")
+        shared = self.base / "current-shared"
+        config_a = self.base / "current-a.json"
+        config_b = self.base / "current-b.json"
+        state_a = self.base / "current-a-state.json"
+        state_b = self.base / "current-b-state.json"
+        daemon_config(config_a, root_a, shared, "current-a")
+        daemon_config(config_b, root_b, shared, "current-b")
+        first = self.cycle(config_a, state_a)
+        second = self.cycle(config_b, state_b)
+        self.assertEqual(first["exported"], [SID])
+        self.assertEqual([item["sessionId"] for item in second["imported"]], [SID])
+        self.assertFalse((root_a / "agents").exists())
+        self.assertTrue(any((root_b / "sessions").glob(f"*_{SID}")))
+        con = sqlite3.connect(root_b / "state.db")
+        self.assertNotIn("agent_id", {row[1] for row in con.execute("PRAGMA table_info(sessions)")})
+        self.assertEqual(con.execute("SELECT title FROM sessions WHERE id=?", (SID,)).fetchone()[0], "Fixture session")
+        con.close()
+
+    def test_current_source_round_trips_to_legacy_target(self):
+        root_a = create_fixture(self.base / "mixed-current", SID, schema="current")
+        root_b = empty_target(self.base / "mixed-legacy")
+        shared = self.base / "mixed-shared"
+        config_a = self.base / "mixed-a.json"
+        config_b = self.base / "mixed-b.json"
+        state_a = self.base / "mixed-a-state.json"
+        state_b = self.base / "mixed-b-state.json"
+        daemon_config(config_a, root_a, shared, "mixed-a")
+        daemon_config(config_b, root_b, shared, "mixed-b")
+        self.assertEqual(self.cycle(config_a, state_a)["exported"], [SID])
+        self.assertEqual([item["sessionId"] for item in self.cycle(config_b, state_b)["imported"]], [SID])
+        con = sqlite3.connect(root_b / "state.db")
+        self.assertEqual(con.execute("SELECT agent_id FROM sessions WHERE id=?", (SID,)).fetchone()[0], "main")
+        con.close()
+
+    def test_claim_finds_current_schema_session_directory(self):
+        root = create_fixture(self.base / "claim-current", SID, schema="current")
+        shared = self.base / "claim-shared"
+        config = self.base / "claim-current.json"
+        state = self.base / "claim-current-state.json"
+        daemon_config(config, root, shared, "claim-current")
+        result = json.loads(run_cli(
+            SYNCD, "--config", config, "--state", state, "claim", SID,
+        ).stdout)
+        self.assertEqual(result["sessionId"], SID)
+        self.assertEqual(result["ownerDeviceId"], "claim-current")
+        self.assertTrue(result["sessionHash"])
+
     def test_v1_config_and_state_migrate(self):
         old_cfg = {
             "deviceId": "legacy", "asideRoot": str(self.root_a), "asideSyncPath": str(SYNC),

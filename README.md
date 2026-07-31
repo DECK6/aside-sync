@@ -125,7 +125,7 @@ remote history under a new session id.
 
 A v2 bundle contains only:
 
-- one `sessions` row exported through an exact 15-field whitelist;
+- one `sessions` row exported through an exact 14-field base whitelist, plus legacy `agent_id` only when the local schema contains it;
 - `session_runs` without its local autoincrement id;
 - required `session_tabs`, preserving attachment `target_id` values;
 - `messages.jsonl`; and selected `artifacts/` and `attachments/` files.
@@ -138,8 +138,10 @@ schema column cannot leak automatically.
 
 Every import validates bundle version, member paths/types, exact member list,
 byte counts, SHA-256 hashes, and every JSONL line before touching local state.
-It validates required local schema and agent ownership, refuses a running local
-session, obtains a SQLite immediate write lease, and mutates rows
+It validates the required local schema and, on legacy agent-scoped databases,
+validates agent ownership. Current agentless Aside databases and legacy
+`agents/<agentId>/sessions` layouts are both supported. It refuses a running
+local session, obtains a SQLite immediate write lease, and mutates rows
 transactionally. Before mutation it uses SQLite's backup API and moves the old
 session directory into the same import backup. The newest 20 import backups are
 kept; older backups go to Trash. Imported live bindings are nulled and a

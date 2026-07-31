@@ -30,6 +30,7 @@ EXPORT_SESSION_FIELDS = (
     "system_prompt", "model", "permission_mode", "permission", "context_window",
     "cwd", "incognito", "created_at", "updated_at",
 )
+OPTIONAL_EXPORT_SESSION_FIELDS = {"agent_id"}
 EXCLUDED_SESSION_FIELDS = {
     "tool_state", "browser_binding", "active_tab_target_id", "queued_messages",
     "steering_messages", "suspension", "runtime_config", "trigger",
@@ -38,14 +39,13 @@ EXCLUDED_SESSION_FIELDS = {
 }
 REQUIRED_LOCAL_COLUMNS = {
     "sessions": {
-        "id", "agent_id", "branched_from", "title", "status", "cwd",
+        "id", "branched_from", "title", "status", "cwd",
         "queued_messages", "suspension", "tool_state", "active_tab_target_id",
         "ephemeral", "read_at", "latest_compaction_message_offset", "archived_at",
         "browser_binding",
     },
     "session_runs": {"id", "session_id", "jsonl_read_offset"},
     "session_tabs": {"id", "session_id", "target_id"},
-    "agents": {"id"},
 }
 
 
@@ -74,12 +74,16 @@ def user_root(value: str | None) -> Path:
     return Path(value).expanduser().resolve() if value else DEFAULT_USER_ROOT
 
 
-def sessions_root(root: Path, agent_id: str = DEFAULT_AGENT_ID) -> Path:
-    return root / "agents" / agent_id / "sessions"
+def sessions_root(root: Path, agent_id: str = DEFAULT_AGENT_ID, *, agent_scoped: bool) -> Path:
+    if agent_scoped:
+        return root / "agents" / agent_id / "sessions"
+    return root / "sessions"
 
 
-def session_dir_for(root: Path, sid: str, agent_id: str = DEFAULT_AGENT_ID) -> Path | None:
-    parent = sessions_root(root, agent_id)
+def session_dir_for(
+    root: Path, sid: str, agent_id: str = DEFAULT_AGENT_ID, *, agent_scoped: bool,
+) -> Path | None:
+    parent = sessions_root(root, agent_id, agent_scoped=agent_scoped)
     if not parent.exists():
         return None
     matches = sorted(p for p in parent.iterdir() if p.is_dir() and p.name.endswith("_" + sid))
@@ -107,6 +111,13 @@ def validate_local_schema(con: sqlite3.Connection) -> dict[str, list[str]]:
         if missing:
             raise SyncError(f"local state.db table {table} is missing required columns: {', '.join(sorted(missing))}")
         found[table] = cols
+    if "agent_id" in found["sessions"]:
+        agent_columns = table_columns(con, "agents")
+        if not agent_columns:
+            raise SyncError("local state.db is missing required table: agents")
+        if "id" not in agent_columns:
+            raise SyncError("local state.db table agents is missing required columns: id")
+        found["agents"] = agent_columns
     return found
 
 
@@ -402,33 +413,36 @@ def export_bundle(args) -> None:
     database = root / "state.db"
     sid = safe_component(args.session_id, "session id")
     agent_id = safe_component(args.agent_id, "agent id")
-    source_session = session_dir_for(root, sid, agent_id)
     if not database.is_file():
         raise SyncError(f"state.db not found: {database}")
-    if source_session is None:
-        raise SyncError(f"session folder not found for {sid}")
-    if source_session.is_symlink():
-        raise SyncError(f"symlinked session folders are not allowed: {source_session}")
-    messages = source_session / "messages.jsonl"
-    if not messages.is_file():
-        raise SyncError(f"messages.jsonl not found: {messages}")
-    if messages.is_symlink():
-        raise SyncError(f"symlinked messages.jsonl is not allowed: {messages}")
-    line_count = validate_jsonl(messages)
 
     con = connect_db(database)
     try:
         columns = table_columns(con, "sessions")
-        missing = set(EXPORT_SESSION_FIELDS) - set(columns)
+        required = set(EXPORT_SESSION_FIELDS) - OPTIONAL_EXPORT_SESSION_FIELDS
+        missing = required - set(columns)
         if missing:
             raise SyncError(f"source sessions table missing export columns: {', '.join(sorted(missing))}")
+        export_fields = tuple(field for field in EXPORT_SESSION_FIELDS if field in columns)
+        agent_scoped = "agent_id" in columns
+        source_session = session_dir_for(root, sid, agent_id, agent_scoped=agent_scoped)
+        if source_session is None:
+            raise SyncError(f"session folder not found for {sid}")
+        if source_session.is_symlink():
+            raise SyncError(f"symlinked session folders are not allowed: {source_session}")
+        messages = source_session / "messages.jsonl"
+        if not messages.is_file():
+            raise SyncError(f"messages.jsonl not found: {messages}")
+        if messages.is_symlink():
+            raise SyncError(f"symlinked messages.jsonl is not allowed: {messages}")
+        line_count = validate_jsonl(messages)
         row = con.execute(
-            f"SELECT {','.join(EXPORT_SESSION_FIELDS)} FROM sessions WHERE id=?", (sid,)
+            f"SELECT {','.join(export_fields)} FROM sessions WHERE id=?", (sid,)
         ).fetchone()
         if row is None:
             raise SyncError(f"source session row not found: {sid}")
         session = dict(row)
-        if set(session) != set(EXPORT_SESSION_FIELDS) or EXCLUDED_SESSION_FIELDS & set(session):
+        if set(session) != set(export_fields) or EXCLUDED_SESSION_FIELDS & set(session):
             raise SyncError("internal export whitelist invariant failed")
         run_cols = [column for column in table_columns(con, "session_runs") if column != "id"]
         tab_cols = table_columns(con, "session_tabs")
@@ -559,6 +573,7 @@ def import_bundle(args) -> None:
         con = connect_db(database)
         try:
             columns = validate_local_schema(con)
+            agent_scoped = "agent_id" in columns["sessions"]
             source_session = db_data["session"]
             agent_id = safe_component(
                 source_session.get("agent_id") or manifest.get("agentId") or DEFAULT_AGENT_ID,
@@ -570,7 +585,7 @@ def import_bundle(args) -> None:
                     sid = rand_id()
                     if (
                         con.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone() is None
-                        and session_dir_for(root, sid, agent_id) is None
+                        and session_dir_for(root, sid, agent_id, agent_scoped=agent_scoped) is None
                     ):
                         break
             else:
@@ -580,9 +595,12 @@ def import_bundle(args) -> None:
                 raise SyncError(f"refusing to overwrite running session: {sid}")
             if existing and not update:
                 raise SyncError(f"destination session exists; use --update-existing: {sid}")
-            if con.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone() is None:
+            if agent_scoped and con.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone() is None:
                 raise SyncError(f"bundle agent_id does not exist locally: {agent_id}")
-            unknown_session = sorted(set(source_session) - set(columns["sessions"]))
+            unknown_session_fields = set(source_session) - set(columns["sessions"])
+            if not agent_scoped:
+                unknown_session_fields.discard("agent_id")
+            unknown_session = sorted(unknown_session_fields)
             for field in unknown_session:
                 eprint(f"warning: ignoring bundle session field absent from local schema: {field}")
             for bundle_name, table_name in (("runs", "session_runs"), ("tabs", "session_tabs")):
@@ -590,10 +608,10 @@ def import_bundle(args) -> None:
                 for field in unknown:
                     eprint(f"warning: ignoring bundle {table_name} field absent from local schema: {field}")
 
-            destination_parent = sessions_root(root, agent_id)
+            destination_parent = sessions_root(root, agent_id, agent_scoped=agent_scoped)
             dirname = f"{dt.date.today().isoformat()}_{sid}" if fork else str(manifest["sessionDirName"])
             destination = destination_parent / dirname
-            existing_dir = session_dir_for(root, sid, agent_id)
+            existing_dir = session_dir_for(root, sid, agent_id, agent_scoped=agent_scoped)
             if existing_dir and not update and not fork:
                 raise SyncError(f"destination session folder exists; use --update-existing: {existing_dir}")
             incoming_size = (extracted / "files" / "messages.jsonl").stat().st_size
@@ -664,7 +682,8 @@ def import_bundle(args) -> None:
 
                 session = {key: value for key, value in source_session.items() if key in EXPORT_SESSION_FIELDS}
                 session["id"] = sid
-                session["agent_id"] = agent_id
+                if agent_scoped:
+                    session["agent_id"] = agent_id
                 branch = source_session.get("branched_from")
                 if fork:
                     session["branched_from"] = original_sid if original_exists else None
@@ -778,23 +797,30 @@ def scrub_v1(args) -> None:
     print(json.dumps({"found": len(matches), "moved": len(moved), "trashPaths": moved}, ensure_ascii=False, indent=2))
 
 
-def list_sessions(root: Path, limit: int) -> list[dict]:
+def list_sessions(root: Path, limit: int, agent_id: str = DEFAULT_AGENT_ID) -> list[dict]:
     database = root / "state.db"
     if not database.is_file():
         raise SyncError(f"state.db not found: {database}")
     con = connect_db(database)
     try:
+        columns = table_columns(con, "sessions")
+        where = "archived_at IS NULL AND ephemeral=0"
+        params: list[object] = []
+        if "agent_id" in columns:
+            where += " AND agent_id=?"
+            params.append(agent_id)
+        params.append(limit)
         return [dict(row) for row in con.execute(
             "SELECT id,title,status,created_at,updated_at,archived_at,ephemeral "
-            "FROM sessions WHERE archived_at IS NULL AND ephemeral=0 ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
+            f"FROM sessions WHERE {where} ORDER BY updated_at DESC LIMIT ?",
+            params,
         )]
     finally:
         con.close()
 
 
 def status(args) -> None:
-    rows = list_sessions(user_root(args.aside_root), args.limit)
+    rows = list_sessions(user_root(args.aside_root), args.limit, args.agent_id)
     print(json.dumps(rows, ensure_ascii=False, indent=2))
 
 
@@ -823,7 +849,8 @@ def pull(args) -> None:
             subprocess_checked(["scp", str(SCRIPT_PATH), f"{args.remote}:{remote_dir}/aside-sync"])
             command = (
                 f"python3 {shell_quote(remote_dir + '/aside-sync')} --aside-root {shell_quote(args.remote_aside_root)} "
-                f"export-bundle {shell_quote(args.session_id)} --output {shell_quote(remote_dir + '/bundle.tgz')}"
+                f"--agent-id {shell_quote(args.agent_id)} export-bundle {shell_quote(args.session_id)} "
+                f"--output {shell_quote(remote_dir + '/bundle.tgz')}"
             )
             subprocess_checked(["ssh", args.remote, command])
             subprocess_checked(["scp", f"{args.remote}:{remote_dir}/bundle.tgz", str(local_bundle)])
@@ -853,7 +880,7 @@ def push(args) -> None:
             flags += " --force" if args.force else ""
             command = (
                 f"python3 {shell_quote(remote_dir + '/aside-sync')} --aside-root {shell_quote(args.remote_aside_root)} "
-                f"import-bundle {shell_quote(remote_dir + '/bundle.tgz')}{flags}"
+                f"--agent-id {shell_quote(args.agent_id)} import-bundle {shell_quote(remote_dir + '/bundle.tgz')}{flags}"
             )
             subprocess_checked(["ssh", args.remote, command])
         finally:

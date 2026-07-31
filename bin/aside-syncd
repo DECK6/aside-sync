@@ -233,11 +233,22 @@ def connect_db(path: Path) -> sqlite3.Connection:
 
 
 def session_dir(aside_root: Path, sid: str, agent_id: str = "main") -> Path | None:
-    root = aside_root / "agents" / agent_id / "sessions"
-    if not root.exists():
-        return None
-    matches = sorted(path for path in root.iterdir() if path.is_dir() and path.name.endswith("_" + sid))
-    return matches[-1] if matches else None
+    roots = (aside_root / "sessions", aside_root / "agents" / agent_id / "sessions")
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            identity = root.resolve()
+        except OSError:
+            identity = root
+        if identity in seen:
+            continue
+        seen.add(identity)
+        matches = sorted(path for path in root.iterdir() if path.is_dir() and path.name.endswith("_" + sid))
+        if matches:
+            return matches[-1]
+    return None
 
 
 def messages_hash(aside_root: Path, sid: str, agent_id: str = "main") -> str | None:
@@ -268,9 +279,16 @@ def local_sessions(config: dict) -> list[dict]:
         raise DaemonError(f"state.db not found: {database}")
     con = connect_db(database)
     try:
+        session_columns = {str(row[1]) for row in con.execute("PRAGMA table_info(sessions)")}
+        where = "archived_at IS NULL AND ephemeral=0"
+        parameters: list[object] = []
+        if "agent_id" in session_columns:
+            where += " AND agent_id=?"
+            parameters.append(config.get("agentId", "main"))
         rows = [dict(row) for row in con.execute(
             "SELECT id,title,status,created_at,updated_at,archived_at,ephemeral "
-            "FROM sessions WHERE archived_at IS NULL AND ephemeral=0 ORDER BY updated_at DESC"
+            f"FROM sessions WHERE {where} ORDER BY updated_at DESC",
+            parameters,
         )]
     finally:
         con.close()

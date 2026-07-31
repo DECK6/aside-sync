@@ -9,7 +9,8 @@ import unittest
 from pathlib import Path
 
 from tests.common import (
-    SYNC, create_fixture, db_snapshot, empty_target, make_v1_bundle, run_cli, tar_json,
+    SYNC, create_fixture, db_snapshot, empty_target, make_v1_bundle, run_cli,
+    session_directory, tar_json,
 )
 
 
@@ -65,9 +66,66 @@ class ImportTests(unittest.TestCase):
         con.close()
         self.assertEqual(tab, (SID, "tab:TARGET-VERBATIM"))
 
+    def test_legacy_bundle_imports_into_current_schema(self):
+        current_target = empty_target(self.base / "current-target", schema="current")
+        result = run_cli(SYNC, "--aside-root", current_target, "import-bundle", self.bundle)
+        output = json.loads(result.stdout)
+        con = sqlite3.connect(current_target / "state.db")
+        columns = {row[1] for row in con.execute("PRAGMA table_info(sessions)")}
+        row = con.execute("SELECT title,status,cwd FROM sessions WHERE id=?", (SID,)).fetchone()
+        tab = con.execute("SELECT target_id FROM session_tabs WHERE session_id=?", (SID,)).fetchone()
+        con.close()
+        self.assertNotIn("agent_id", columns)
+        self.assertEqual(row[:2], ("Fixture session", "idle"))
+        self.assertEqual(row[2], output["sessionDir"])
+        self.assertEqual(tab[0], "tab:TARGET-VERBATIM")
+        self.assertEqual(Path(output["sessionDir"]).parent, current_target / "sessions")
+
+    def test_current_bundle_imports_into_legacy_schema(self):
+        current_source = create_fixture(self.base / "current-source", SID, schema="current")
+        current_bundle = self.base / "current-bundle.tgz"
+        run_cli(SYNC, "--aside-root", current_source, "export-bundle", SID, "--output", current_bundle)
+        legacy_target = empty_target(self.base / "legacy-target")
+        result = run_cli(SYNC, "--aside-root", legacy_target, "import-bundle", current_bundle)
+        output = json.loads(result.stdout)
+        con = sqlite3.connect(legacy_target / "state.db")
+        agent_id = con.execute("SELECT agent_id FROM sessions WHERE id=?", (SID,)).fetchone()[0]
+        con.close()
+        self.assertEqual(agent_id, "main")
+        self.assertEqual(Path(output["sessionDir"]).parent, legacy_target / "agents" / "main" / "sessions")
+
+    def test_current_schema_update_and_fork_use_direct_sessions_directory(self):
+        current_target = empty_target(self.base / "current-update", schema="current")
+        run_cli(SYNC, "--aside-root", current_target, "import-bundle", self.bundle)
+        updated = json.loads(run_cli(
+            SYNC, "--aside-root", current_target, "import-bundle", self.bundle,
+            "--update-existing", "--force",
+        ).stdout)
+        forked = json.loads(run_cli(
+            SYNC, "--aside-root", current_target, "import-bundle", self.bundle, "--as-new-session",
+        ).stdout)
+        self.assertEqual(Path(updated["sessionDir"]).parent, current_target / "sessions")
+        self.assertEqual(Path(forked["sessionDir"]).parent, current_target / "sessions")
+        con = sqlite3.connect(current_target / "state.db")
+        branch = con.execute("SELECT branched_from FROM sessions WHERE id=?", (forked["imported"],)).fetchone()[0]
+        con.close()
+        self.assertEqual(branch, SID)
+
+    def test_legacy_agent_schema_still_requires_agents_table(self):
+        broken_target = empty_target(self.base / "broken-legacy")
+        con = sqlite3.connect(broken_target / "state.db")
+        con.execute("DROP TABLE agents")
+        con.commit()
+        con.close()
+        result = run_cli(
+            SYNC, "--aside-root", broken_target, "import-bundle", self.bundle, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing required table: agents", result.stderr)
+
     def test_update_existing_replaces_rows_and_creates_backup(self):
         self.import_bundle()
-        dest = next((self.target / "agents/main/sessions").glob(f"*_{SID}"))
+        dest = session_directory(self.target, SID)
         (dest / "messages.jsonl").write_text('{"local":"old"}\n', encoding="utf-8")
         con = sqlite3.connect(self.target / "state.db")
         con.execute("UPDATE sessions SET status='idle', title='local old' WHERE id=?", (SID,))

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.common import SYNC, create_fixture, run_cli, sha256, tar_json
+from tests.common import SYNC, create_fixture, run_cli, session_directory, sha256, tar_json
 
 
 SID = "sessionABC123456"
@@ -62,6 +62,21 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(manifest["dbCounts"], {"runs": 1, "tabs": 1})
         self.assertEqual(len(manifest["files"]), 1)
 
+    def test_current_schema_export_omits_optional_agent_field(self):
+        current_root = create_fixture(self.base / "current", SID, schema="current")
+        current_bundle = self.base / "current.tgz"
+        run_cli(
+            SYNC, "--aside-root", current_root, "export-bundle", SID,
+            "--output", current_bundle, "--source-device-id", "device-current",
+        )
+        db = tar_json(current_bundle, "db.json")
+        manifest = tar_json(current_bundle, "manifest.json")
+        self.assertEqual(set(db["session"]), EXPECTED - {"agent_id"})
+        self.assertNotIn("agent_id", db["session"])
+        self.assertEqual(manifest["agentId"], "main")
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertTrue(str(session_directory(current_root, SID)).startswith(str(current_root / "sessions")))
+
     def test_attachment_opt_in_and_tmp_always_excluded(self):
         self.export("--include-attachments")
         with tarfile.open(self.bundle, "r:gz") as tf:
@@ -70,7 +85,7 @@ class BundleTests(unittest.TestCase):
         self.assertFalse(any("tmp" in Path(n).parts for n in names))
 
     def test_jsonl_validation_fails_without_publishing_partial_bundle(self):
-        msg = next((self.root / "agents/main/sessions").glob(f"*_{SID}")) / "messages.jsonl"
+        msg = session_directory(self.root, SID) / "messages.jsonl"
         msg.write_text('{"ok":true}\nnot-json\n', encoding="utf-8")
         result = self.export(check=False) if False else run_cli(
             SYNC, "--aside-root", self.root, "export-bundle", SID,
@@ -92,7 +107,7 @@ class BundleTests(unittest.TestCase):
     def test_export_rejects_symlinked_content(self):
         secret = self.base / "outside-secret.txt"
         secret.write_text("must stay outside", encoding="utf-8")
-        artifacts = next((self.root / "agents/main/sessions").glob(f"*_{SID}")) / "artifacts"
+        artifacts = session_directory(self.root, SID) / "artifacts"
         (artifacts / "outside-link.txt").symlink_to(secret)
         result = run_cli(
             SYNC, "--aside-root", self.root, "export-bundle", SID,

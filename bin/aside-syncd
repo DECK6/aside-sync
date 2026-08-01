@@ -32,6 +32,8 @@ CONFIG_SCHEMA = 2
 STATE_SCHEMA = 2
 INDEX_SCHEMA = 2
 LOG_LIMIT = 5 * 1024 * 1024
+CLOUD_READ_ATTEMPTS = 4
+CLOUD_READ_DELAY_SECONDS = 1
 
 
 class DaemonError(RuntimeError):
@@ -64,14 +66,14 @@ def load_json(path: Path, default):
     if not path.exists():
         return default
     try:
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            if exc.errno != errno.EDEADLK:
-                raise
-            nudge_cloud_download(path)
-            time.sleep(1)
-            return json.loads(path.read_text(encoding="utf-8"))
+        for attempt in range(CLOUD_READ_ATTEMPTS):
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except OSError as exc:
+                if exc.errno != errno.EDEADLK or attempt == CLOUD_READ_ATTEMPTS - 1:
+                    raise
+                nudge_cloud_download(path)
+                time.sleep(CLOUD_READ_DELAY_SECONDS)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise DaemonError(f"invalid JSON file {path}: {exc}") from exc
 
@@ -598,7 +600,12 @@ def unresolved_duplicate(sync_dir: Path, record: dict) -> Path | None:
         return None
     keys = ("sessionId", "sourceDeviceId", "localHash", "remoteHash")
     for path in sorted(directory.glob(f"{record['sessionId']}-*.json"), reverse=True):
-        current = load_json(path, {})
+        try:
+            current = load_json(path, {})
+        except OSError as exc:
+            if exc.errno == errno.EDEADLK:
+                continue
+            raise
         if current.get("resolution") is None and all(current.get(key) == record.get(key) for key in keys):
             return path
     return None
@@ -619,7 +626,11 @@ def record_conflict(config: dict, sid: str, source: str, local_hash: str, remote
     }
     duplicate = unresolved_duplicate(sync_dir, record)
     if duplicate:
-        return duplicate, load_json(duplicate, record)
+        try:
+            return duplicate, load_json(duplicate, record)
+        except OSError as exc:
+            if exc.errno != errno.EDEADLK:
+                raise
     path = sync_dir / "conflicts" / f"{sid}-{detected}.json"
     while path.exists():
         detected += 1

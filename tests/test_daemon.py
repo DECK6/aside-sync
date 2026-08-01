@@ -141,7 +141,7 @@ class DaemonTests(unittest.TestCase):
         reads = {"n": 0}
 
         def flaky_read_text(path_self, *args, **kwargs):
-            if path_self == target and reads["n"] == 0:
+            if path_self == target and reads["n"] < 3:
                 reads["n"] += 1
                 raise deadlock
             return real_read_text(path_self, *args, **kwargs)
@@ -153,7 +153,24 @@ class DaemonTests(unittest.TestCase):
             with mock.patch.object(Path, "read_text", flaky_read_text):
                 data = api["load_json"](target, None)
         self.assertEqual(data, {"ok": True})
-        self.assertEqual(nudged, [target])
+        self.assertEqual(nudged, [target, target, target])
+
+    def test_unresolved_duplicate_skips_persistently_dataless_conflict(self):
+        api = runpy.run_path(str(SYNCD))
+        sync_dir = self.base / "dataless-conflict"
+        conflict_dir = sync_dir / "conflicts"
+        conflict_dir.mkdir(parents=True)
+        conflict = conflict_dir / f"{SID}-1.json"
+        conflict.write_text("{}", encoding="utf-8")
+        record = {
+            "sessionId": SID, "sourceDeviceId": "device-a",
+            "localHash": "a" * 64, "remoteHash": "b" * 64,
+        }
+        deadlock = OSError(errno.EDEADLK, "Resource deadlock avoided")
+        with mock.patch.dict(api["unresolved_duplicate"].__globals__, {
+            "load_json": lambda path, default: (_ for _ in ()).throw(deadlock),
+        }):
+            self.assertIsNone(api["unresolved_duplicate"](sync_dir, record))
 
     def test_log_rotates_at_five_megabytes(self):
         config = json.loads(self.config_a.read_text())

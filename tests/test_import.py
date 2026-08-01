@@ -79,7 +79,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(row[:2], ("Fixture session", "idle"))
         self.assertEqual(row[2], output["sessionDir"])
         self.assertEqual(tab[0], "tab:TARGET-VERBATIM")
-        self.assertEqual(Path(output["sessionDir"]).parent, current_target / "sessions")
+        self.assertEqual(Path(output["sessionDir"]).parent, (current_target / "sessions").resolve())
 
     def test_current_bundle_imports_into_legacy_schema(self):
         current_source = create_fixture(self.base / "current-source", SID, schema="current")
@@ -92,7 +92,10 @@ class ImportTests(unittest.TestCase):
         agent_id = con.execute("SELECT agent_id FROM sessions WHERE id=?", (SID,)).fetchone()[0]
         con.close()
         self.assertEqual(agent_id, "main")
-        self.assertEqual(Path(output["sessionDir"]).parent, legacy_target / "agents" / "main" / "sessions")
+        self.assertEqual(
+            Path(output["sessionDir"]).parent,
+            (legacy_target / "agents" / "main" / "sessions").resolve(),
+        )
 
     def test_current_schema_update_and_fork_use_direct_sessions_directory(self):
         current_target = empty_target(self.base / "current-update", schema="current")
@@ -104,8 +107,8 @@ class ImportTests(unittest.TestCase):
         forked = json.loads(run_cli(
             SYNC, "--aside-root", current_target, "import-bundle", self.bundle, "--as-new-session",
         ).stdout)
-        self.assertEqual(Path(updated["sessionDir"]).parent, current_target / "sessions")
-        self.assertEqual(Path(forked["sessionDir"]).parent, current_target / "sessions")
+        self.assertEqual(Path(updated["sessionDir"]).parent, (current_target / "sessions").resolve())
+        self.assertEqual(Path(forked["sessionDir"]).parent, (current_target / "sessions").resolve())
         con = sqlite3.connect(current_target / "state.db")
         branch = con.execute("SELECT branched_from FROM sessions WHERE id=?", (forked["imported"],)).fetchone()[0]
         con.close()

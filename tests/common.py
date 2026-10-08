@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -16,10 +17,11 @@ SYNCD = REPO / "bin" / "aside-syncd"
 
 
 def run_cli(script: Path, *args: object, check: bool = True, env=None):
-    command = [str(script), *(str(x) for x in args)]
+    command = [sys.executable, "-X", "utf8", str(script), *(str(x) for x in args)]
     return subprocess.run(
         command,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=check,
@@ -251,4 +253,3 @@ def append_message(root: Path, sid: str, marker: str) -> str:
     con.commit()
     con.close()
     return sha256(sdir / "messages.jsonl")
-

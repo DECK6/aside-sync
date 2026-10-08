@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -192,6 +193,19 @@ def ensure_skeleton(sync_dir: Path) -> None:
 
 
 def move_to_trash(path: Path, trash_dir: Path | None = None) -> Path:
+    if sys.platform == "win32" and trash_dir is None:
+        environment = os.environ.copy()
+        environment["ASIDE_SYNC_TRASH_PATH"] = str(path.resolve())
+        script = (
+            "$ErrorActionPreference='Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; "
+            "$p=$env:ASIDE_SYNC_TRASH_PATH; "
+            "if ([IO.Directory]::Exists($p)) { "
+            "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin') "
+            "} else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin') }"
+        )
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env=environment, check=True, capture_output=True, text=True)
+        return path
     trash = trash_dir or (Path.home() / ".Trash")
     trash.mkdir(parents=True, exist_ok=True)
     base = f"{path.name}.{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
@@ -379,6 +393,7 @@ def macos_keychain_passphrase(service: str) -> str:
 
 def command_env(config: dict) -> dict:
     environment = os.environ.copy()
+    environment["PYTHONUTF8"] = "1"
     backend = (config.get("security") or {}).get("encryption", "none")
     if backend in ("gpg", "openssl") and not environment.get("ASIDE_SYNC_PASSPHRASE"):
         environment["ASIDE_SYNC_PASSPHRASE"] = macos_keychain_passphrase(
@@ -402,7 +417,8 @@ def run_process(command: list[str], *, config: dict, input_text: str | None = No
 
 def core_command(config: dict, operation: list[str]) -> dict:
     executable = str(Path(config["asideSyncPath"]).expanduser())
-    command = [executable, "--aside-root", str(Path(config["asideRoot"]).expanduser()), "--agent-id", config.get("agentId", "main"), *operation]
+    launcher = [sys.executable, executable] if sys.platform == "win32" and Path(executable).suffix in ("", ".py") else [executable]
+    command = [*launcher, "--aside-root", str(Path(config["asideRoot"]).expanduser()), "--agent-id", config.get("agentId", "main"), *operation]
     result = run_process(command, config=config)
     try:
         return json.loads(result.stdout)
@@ -508,7 +524,11 @@ def export_sessions(config: dict, state: dict, *, dry_run: bool = False, force_s
         if files.get("attachments", False):
             operation.append("--include-attachments")
         operation += encryption_arguments(config)
-        core_command(config, operation)
+        try:
+            core_command(config, operation)
+        except (DaemonError, OSError, subprocess.CalledProcessError) as exc:
+            skipped.append({"sessionId": sid, "reason": "export-failed", "error": str(exc)[:200]})
+            continue
         session_state["lastExportedHash"] = message_hash
         session_state["lastExportedAt"] = now_epoch()
         exported.append(sid)
@@ -554,7 +574,7 @@ def write_index(config: dict, index: dict) -> Path:
     return final
 
 
-def read_indexes(config: dict) -> tuple[list[tuple[Path, dict]], list[str]]:
+def read_indexes(config: dict, *, tolerate_errors: bool = False) -> tuple[list[tuple[Path, dict]], list[str]]:
     directory = Path(config["syncDir"]).expanduser() / "indexes"
     if not directory.exists():
         return [], []
@@ -566,6 +586,11 @@ def read_indexes(config: dict) -> tuple[list[tuple[Path, dict]], list[str]]:
         try:
             data = read_one_index(config, path)
         except OSError:
+            unreadable.append(path.name)
+            continue
+        except DaemonError:
+            if not tolerate_errors:
+                raise
             unreadable.append(path.name)
             continue
         if data is not None and data.get("schemaVersion") == INDEX_SCHEMA:
@@ -668,10 +693,6 @@ def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[
             if not valid_sync_id(sid) or not isinstance(remote_hash, str) or len(remote_hash) != 64 or any(c not in "0123456789abcdef" for c in remote_hash.lower()):
                 skipped.append({"sessionId": sid, "reason": "unsafe-remote-index-entry", "sourceDeviceId": source})
                 continue
-            bundle = find_bundle(config, sid, source, remote_hash)
-            if bundle is None:
-                skipped.append({"sessionId": sid, "reason": "bundle-missing", "sourceDeviceId": source})
-                continue
             session_state = state.setdefault("sessions", {}).setdefault(sid, {})
             local = local_map.get(sid)
             local_hash = messages_hash(aside_root, sid, config.get("agentId", "main")) if local else None
@@ -687,6 +708,12 @@ def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[
             if local and last_imported == remote_hash:
                 # Remote still advertises the version we already imported and
                 # local has moved on; nothing new to pull for this session.
+                continue
+            # Peers advertise imported histories too, without duplicating the
+            # original author's bundle. Equal/already-imported hashes need no I/O.
+            bundle = find_bundle(config, sid, source, remote_hash)
+            if bundle is None:
+                skipped.append({"sessionId": sid, "reason": "bundle-missing", "sourceDeviceId": source})
                 continue
             diverged = bool(local and (last_imported is None or (local_hash != last_imported and remote_hash != last_imported)))
             if diverged:
@@ -723,18 +750,50 @@ def import_remote(config: dict, state: dict, *, dry_run: bool = False) -> tuple[
     return imported, skipped, conflicts, planned
 
 
+def cycle_summary(report: dict, started_at: int) -> dict:
+    skipped = report.get("skipped") or []
+    reasons = {}
+    for item in skipped:
+        reason = item.get("reason", "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {
+        "startedAt": started_at, "finishedAt": now_epoch(),
+        "outcome": "partial" if skipped or report.get("conflicts") else "completed",
+        "exportedCount": len(report.get("exported") or []),
+        "importedCount": len(report.get("imported") or []),
+        "skippedByReason": reasons,
+        "conflictCount": len(report.get("conflicts") or []),
+        # Persist only a classification, never subprocess error contents.
+        "cloudFilesUnavailable": any(
+            any(marker in str(item.get("error", "")).lower()
+                for marker in ("resource deadlock avoided", "edeadlk", "cloud file"))
+            for item in skipped
+        ),
+    }
+
+
 def run_once(args) -> None:
     dry_run = bool(getattr(args, "dry_run", False))
     config = load_config(args.config, migrate=not dry_run)
     state_path = Path(args.state).expanduser()
     state, _ = load_state(state_path)
     sync_dir = Path(config["syncDir"]).expanduser()
-    if not dry_run:
-        ensure_skeleton(sync_dir)
-    exported, export_skipped, export_plan = export_sessions(config, state, dry_run=dry_run)
-    if not dry_run:
-        write_index(config, make_index(config))
-    imported, import_skipped, conflicts, import_plan = import_remote(config, state, dry_run=dry_run)
+    started_at = now_epoch()
+    try:
+        if not dry_run:
+            ensure_skeleton(sync_dir)
+        exported, export_skipped, export_plan = export_sessions(config, state, dry_run=dry_run)
+        if not dry_run:
+            write_index(config, make_index(config))
+        imported, import_skipped, conflicts, import_plan = import_remote(config, state, dry_run=dry_run)
+    except (DaemonError, OSError, sqlite3.Error, subprocess.CalledProcessError) as exc:
+        if not dry_run:
+            state["lastCycle"] = {
+                "startedAt": started_at, "finishedAt": now_epoch(),
+                "outcome": "failed", "errorType": type(exc).__name__,
+            }
+            save_json(state_path, state)
+        raise
     report = {
         "exported": exported,
         "imported": imported,
@@ -744,6 +803,7 @@ def run_once(args) -> None:
     if dry_run:
         report = {"dryRun": True, **report, "actions": export_plan + [{"action": "write-index"}] + import_plan}
     else:
+        state["lastCycle"] = cycle_summary(report, started_at)
         save_json(state_path, state)
         structured_log(config, "sync-cycle", report=report)
     print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
@@ -868,22 +928,95 @@ def resolve(args) -> None:
     print(json.dumps({"sessionId": args.session_id, "resolution": resolution, "recordPath": str(path)}, indent=2))
 
 
-def status(args) -> None:
-    config = load_config(args.config)
+def cloud_download_hint() -> str:
+    if sys.platform == "darwin":
+        return "On each Mac, enable Finder > AsideSync > Keep Downloaded, then check the next cycle."
+    return "Keep the shared folder downloaded on each device (Always keep on this device), then check the next cycle."
+
+
+def aside_experimental_sync(config: dict) -> dict:
+    path = Path(config["asideRoot"]).expanduser() / "settings.json"
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        experimental = settings.get("experimental") if isinstance(settings, dict) else None
+        enabled = experimental.get("sync") if isinstance(experimental, dict) else None
+    except (OSError, ValueError):
+        enabled = None
+    return {"enabled": enabled if isinstance(enabled, bool) else None}
+
+
+def sync_health(config: dict, cycle: dict | None, indexes: list[dict], unreadable: list[str], conflicts: list[dict], unreadable_conflicts: list[str], *, folder_error: str | None = None) -> dict:
+    issues = []
+    current = now_epoch()
+    stale_after = max(900, int(config["intervalSeconds"]) * 3)
+    def issue(code: str, hint: str, **details):
+        issues.append({"code": code, "hint": hint, **details})
+    if not cycle:
+        issue("no-cycle", "No completed cycle has been recorded by this version yet. Run sync or wait for its schedule.")
+    else:
+        finished = cycle.get("finishedAt")
+        if not isinstance(finished, (int, float)) or current - finished > stale_after:
+            issue("cycle-stale", "No recent cycle has finished. Check the device's sync scheduler.")
+        if cycle.get("outcome") == "failed":
+            issue("cycle-failed", "The last cycle failed. Inspect the sync log or run run-once for the error.")
+        reasons = cycle.get("skippedByReason") or {}
+        if reasons:
+            issue("sessions-skipped", "Some work is waiting or failed. Check skipped reasons in the cycle log.", reasons=reasons)
+        if cycle.get("cloudFilesUnavailable"):
+            issue("cloud-files-unavailable", cloud_download_hint())
+    if unreadable:
+        issue("index-unreadable", "Check the index format and encryption key. For online-only cloud files: " + cloud_download_hint(), files=unreadable)
+    peers = [item for item in indexes if item.get("deviceId") != config["deviceId"]]
+    if folder_error:
+        issue("sync-folder-unavailable", "This process cannot list the shared folder. Check its path, cloud drive and permissions. On macOS, SSH access may differ from the locally scheduled process; check from that Mac's Terminal.", errorType=folder_error)
+    elif not peers:
+        issue("no-peer", "No readable peer index is visible. Check the shared folder and unique device ids on both devices.")
+    for peer in peers:
+        heartbeat = peer.get("heartbeatAt")
+        if not isinstance(heartbeat, (int, float)) or current - heartbeat > stale_after:
+            issue("peer-stale", "The peer may be asleep, offline, or unable to sync its folder. Check that device.", deviceId=peer.get("deviceId"))
+    if conflicts:
+        issue("unresolved-conflicts", "Choose local, remote, or fork with resolve after reviewing each conflict.", count=len(conflicts))
+    if unreadable_conflicts:
+        issue("conflict-unreadable", "Some conflict records could not be read. Check their format and download availability.", files=unreadable_conflicts)
+    return {"ok": not issues, "staleAfterSeconds": stale_after, "issues": issues}
+
+
+def status(args) -> int:
+    config = load_config(args.config, migrate=False)
     sync_dir = Path(config["syncDir"]).expanduser()
     state, _ = load_state(Path(args.state).expanduser())
+    folder_error = None
+    try:
+        os.listdir(sync_dir)
+    except OSError as exc:
+        folder_error = type(exc).__name__
     indexes = []
-    readable, _unreadable = read_indexes(config)
+    readable, unreadable = read_indexes(config, tolerate_errors=True) if folder_error is None else ([], [])
     for _, index in readable:
         indexes.append({"deviceId": index.get("deviceId"), "heartbeatAt": index.get("heartbeatAt"), "sessions": len(index.get("sessions") or [])})
     conflicts = []
+    unreadable_conflicts = []
     conflict_dir = sync_dir / "conflicts"
-    if conflict_dir.exists():
-        conflicts = [load_json(path, {}) for path in sorted(conflict_dir.glob("*.json")) if load_json(path, {}).get("resolution") is None]
+    if folder_error is None and conflict_dir.exists():
+        for path in sorted(conflict_dir.glob("*.json")):
+            try:
+                record = load_json(path, {})
+            except (OSError, DaemonError):
+                unreadable_conflicts.append(path.name)
+                continue
+            if record.get("resolution") is None:
+                conflicts.append(record)
+    cycle = state.get("lastCycle")
+    health = sync_health(config, cycle, indexes, unreadable, conflicts, unreadable_conflicts, folder_error=folder_error)
     print(json.dumps({
         "deviceId": config["deviceId"], "syncDir": str(sync_dir), "indexes": indexes,
         "trackedSessions": len(state.get("sessions") or {}), "unresolvedConflicts": conflicts,
+        "unreadableIndexes": unreadable, "lastCycle": cycle, "health": health,
+        "unreadableConflicts": unreadable_conflicts,
+        "asideExperimentalSync": aside_experimental_sync(config),
     }, ensure_ascii=False, indent=2))
+    return 1 if getattr(args, "check", False) and not health["ok"] else 0
 
 
 def numbered_choice(prompt: str, choices: list[str], default: int) -> int:
@@ -917,6 +1050,9 @@ def detected_sync_roots() -> list[Path]:
     candidates = [home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"]
     candidates += sorted((home / "Library" / "CloudStorage").glob("Dropbox*"))
     candidates += [home / "Dropbox"]
+    candidates += [home / "iCloudDrive", home / "iCloud Drive", home / "OneDrive"]
+    candidates += [Path(os.environ[key]) for key in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial") if os.environ.get(key)]
+    candidates += sorted(home.glob("OneDrive -*"))
     # Google Drive localizes the folder name per system language.
     my_drive_names = (
         "My Drive", "내 드라이브", "マイドライブ", "我的云端硬盘", "Mi unidad",
@@ -924,6 +1060,10 @@ def detected_sync_roots() -> list[Path]:
     )
     for mount in sorted((home / "Library" / "CloudStorage").glob("GoogleDrive-*")):
         candidates += [mount / name for name in my_drive_names]
+    if sys.platform == "win32":
+        # Drive for Desktop defaults to a virtual drive; its name is localized.
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            candidates += [Path(f"{letter}:/") / name for name in my_drive_names]
     candidates += [home / "Syncthing"]
     seen, existing = set(), []
     for path in candidates:
@@ -935,7 +1075,7 @@ def detected_sync_roots() -> list[Path]:
 
 def looks_cloud_path(path: Path) -> bool:
     text = str(path).lower()
-    markers = ("cloudstorage", "mobile documents", "dropbox", "googledrive", "google drive", "onedrive")
+    markers = ("cloudstorage", "mobile documents", "icloud", "dropbox", "googledrive", "google drive", "onedrive")
     return any(marker in text for marker in markers)
 
 
@@ -975,10 +1115,13 @@ def choose_encryption_backend(key_file: Path, keychain_service: str) -> str:
         return "age"
     if shutil.which("gpg") or shutil.which("openssl"):
         backend = "gpg" if shutil.which("gpg") else "openssl"
-        macos_store_keychain_passphrase(keychain_service, prompt_shared_passphrase())
+        if sys.platform == "darwin":
+            macos_store_keychain_passphrase(keychain_service, prompt_shared_passphrase())
+        elif not os.environ.get("ASIDE_SYNC_PASSPHRASE"):
+            raise DaemonError("install age and age-keygen, or set ASIDE_SYNC_PASSPHRASE in the environment of both setup and the scheduled process")
         if backend == "openssl":
             print("CAVEAT: OpenSSL AES-CBC is not authenticated; inner manifest hashes provide integrity checking.")
-        print(f"Passphrase stored in macOS Keychain service {keychain_service!r}.")
+        print(f"Passphrase source: {'macOS Keychain ' + keychain_service if sys.platform == 'darwin' else 'ASIDE_SYNC_PASSPHRASE environment'}.")
         print("Enter the same passphrase on every device; never share it through the sync folder.")
         return backend
     raise DaemonError("no encryption backend installed (age, gpg, or openssl)")
@@ -1088,8 +1231,12 @@ def setup_wizard(args) -> None:
         encrypt_index = security_number == 3
         backend = choose_encryption_backend(key_file, keychain_service)
 
-    automation_number = numbered_choice("Automation", ["manual only", "foreground daemon", "LaunchAgent"], 1)
-    automation = ("manual", "daemon", "launchagent")[automation_number - 1]
+    scheduled = "Task Scheduler" if sys.platform == "win32" else "LaunchAgent"
+    choices = ["manual only", "foreground daemon"]
+    if sys.platform in ("win32", "darwin"):
+        choices.append(scheduled)
+    automation_number = numbered_choice("Automation", choices, 1)
+    automation = ("manual", "daemon", "scheduled-task" if sys.platform == "win32" else "launchagent")[automation_number - 1]
     config = default_config()
     config.update({"deviceId": device_id, "syncDir": str(sync_dir), "scope": scope, "files": files})
     config["security"].update({
@@ -1112,7 +1259,9 @@ def setup_wizard(args) -> None:
     print(f"\nConfiguration written: {Path(args.config).expanduser()}")
     print("Nothing was started. Next commands:")
     print("  aside-syncd run-once                 # try one sync cycle")
-    print("  aside-syncd install-launchagent      # enable scheduled sync")
+    if sys.platform in ("win32", "darwin"):
+        install_command = "install-scheduled-task" if sys.platform == "win32" else "install-launchagent"
+        print(f"  aside-syncd {install_command}      # enable scheduled sync")
     print("  aside-syncd uninstall                # undo local installation state")
     if automation == "daemon":
         print("  aside-syncd daemon                   # run in the foreground")
@@ -1199,6 +1348,9 @@ def uninstall_launchagent(args) -> None:
 
 
 def disable(args) -> None:
+    if sys.platform == "win32":
+        print(json.dumps(windows_task_action(args, "/Change", "/Disable"), indent=2))
+        return
     output = launchagent_path(args.label, args.output)
     if args.dry_run:
         print(json.dumps({"dryRun": True, "action": f"launchctl bootout gui/{os.getuid()} {output}"}, indent=2))
@@ -1208,6 +1360,15 @@ def disable(args) -> None:
 
 def uninstall(args) -> None:
     config = load_config(args.config)
+    if sys.platform == "win32":
+        task = windows_task_action(args, "/Delete", "/F")
+        targets = [Path(args.config).expanduser(), Path(args.state).expanduser()]
+        if args.dry_run:
+            print(json.dumps({"dryRun": True, "task": task, "recycle": [str(p) for p in targets]}, indent=2))
+            return
+        recycled = [str(move_to_trash(p)) for p in targets if p.exists()]
+        print(json.dumps({"task": task, "recycledSources": recycled, "sharedFolderRetained": True}, indent=2))
+        return
     output = launchagent_path(args.label, args.output)
     targets = [output, Path(args.config).expanduser(), Path(args.state).expanduser()]
     if args.dry_run:
@@ -1229,6 +1390,81 @@ def uninstall(args) -> None:
             "keyFile": config["security"]["keyFile"],
         },
     }, indent=2))
+
+
+def windows_task_xml(config: dict, args, user_id: str) -> str:
+    interval = int(config["intervalSeconds"])
+    if interval < 60:
+        raise DaemonError("Windows scheduled sync requires intervalSeconds >= 60")
+    task = ET.Element("Task", {"version": "1.2", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
+    def element(parent, name, text=None, **attributes):
+        item = ET.SubElement(parent, name, attributes)
+        if text is not None: item.text = str(text)
+        return item
+    trigger = element(element(task, "Triggers"), "TimeTrigger")
+    repeat = element(trigger, "Repetition")
+    element(repeat, "Interval", f"PT{interval}S")
+    element(repeat, "StopAtDurationEnd", "false")
+    element(trigger, "StartBoundary", (dt.datetime.now() + dt.timedelta(seconds=5)).isoformat(timespec="seconds"))
+    element(trigger, "Enabled", "true")
+    principal = element(element(task, "Principals"), "Principal", id="Author")
+    element(principal, "UserId", user_id)
+    element(principal, "LogonType", "InteractiveToken")
+    element(principal, "RunLevel", "LeastPrivilege")
+    settings = element(task, "Settings")
+    for name, value in (("MultipleInstancesPolicy", "IgnoreNew"), ("DisallowStartIfOnBatteries", "false"),
+                        ("StopIfGoingOnBatteries", "false"), ("StartWhenAvailable", "true"),
+                        ("Enabled", "true"), ("ExecutionTimeLimit", "PT0S")):
+        element(settings, name, value)
+    action = element(element(task, "Actions", Context="Author"), "Exec")
+    element(action, "Command", sys.executable)
+    arguments = ["-X", "utf8", str(Path(__file__).resolve()), "--config", str(Path(args.config).expanduser().absolute()),
+                 "--state", str(Path(args.state).expanduser().absolute()), "run-once"]
+    element(action, "Arguments", subprocess.list2cmdline(arguments))
+    return ET.tostring(task, encoding="unicode")
+
+
+def install_scheduled_task(args) -> None:
+    config = load_config(args.config, migrate=not args.dry_run)
+    account = getpass.getuser()
+    if os.environ.get("USERDOMAIN"):
+        account = os.environ["USERDOMAIN"] + "\\" + account
+    xml = windows_task_xml(config, args, account)
+    if args.dry_run:
+        print(json.dumps({"dryRun": True, "taskName": args.label, "xml": xml}, indent=2))
+        return
+    if sys.platform != "win32":
+        raise DaemonError("Task Scheduler commands are available only on Windows")
+    with tempfile.TemporaryDirectory(prefix="aside-sync-task-") as tmp:
+        path = Path(tmp)/"task.xml"
+        path.write_text(xml, encoding="utf-16")
+        subprocess_checked_task(["/Create", "/TN", args.label, "/XML", str(path), "/F"])
+    print(json.dumps({"installed": True, "taskName": args.label, "intervalSeconds": config["intervalSeconds"]}))
+
+
+def subprocess_checked_task(arguments: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["schtasks.exe", *arguments], check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise DaemonError(f"Task Scheduler failed: {getattr(exc, 'stderr', '') or exc}") from exc
+
+
+def windows_task_action(args, *action: str) -> dict:
+    if args.dry_run:
+        return {"dryRun": True, "command": ["schtasks.exe", *action, "/TN", args.label]}
+    if sys.platform != "win32":
+        raise DaemonError("Task Scheduler commands are available only on Windows")
+    if action[0] == "/Delete":
+        saved = subprocess_checked_task(["/Query", "/TN", args.label, "/XML"])
+        backup = Path(args.config).expanduser().parent/"backups"/("scheduled-task-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".xml")
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_text(saved.stdout, encoding="utf-16")
+    subprocess_checked_task([*action, "/TN", args.label])
+    return {"taskName": args.label, "action": list(action), "completed": True}
+
+
+def uninstall_scheduled_task(args) -> None:
+    print(json.dumps(windows_task_action(args, "/Delete", "/F"), indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1283,6 +1519,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.set_defaults(func=resolve)
 
     command = commands.add_parser("status")
+    command.add_argument("--check", action="store_true", help="exit 1 if cycles, peer visibility, unreadable files, or conflicts need attention")
     command.set_defaults(func=status)
 
     command = commands.add_parser("encryption")
@@ -1296,6 +1533,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--dry-run", action="store_true")
     command.add_argument("--trash-dir", help=argparse.SUPPRESS)
     command.set_defaults(func=install_launchagent)
+
+    for name, function in (("install-scheduled-task", install_scheduled_task), ("uninstall-scheduled-task", uninstall_scheduled_task)):
+        command = commands.add_parser(name)
+        command.add_argument("--label", default="com.deck.aside-syncd")
+        command.add_argument("--dry-run", action="store_true")
+        command.set_defaults(func=function)
 
     command = commands.add_parser("uninstall-launchagent")
     command.add_argument("--label", default="com.deck.aside-syncd")
@@ -1322,8 +1565,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        args.func(args)
-        return 0
+        return args.func(args) or 0
     except (DaemonError, OSError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)

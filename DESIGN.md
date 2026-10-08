@@ -145,7 +145,8 @@ inside. Ever.**
 `sessions` row: export ONLY these fields (`EXPORT_SESSION_FIELDS`):
 `id, parent_id, branched_from, title, status, system_prompt, model,
 permission_mode, permission, context_window, cwd, incognito, created_at,
-updated_at`, plus `agent_id` only when the local legacy schema contains it.
+updated_at`, plus `agent_id`, `harness_id`, and `transcript_revision` only when
+the local schema contains them.
 `manifest.agentId` remains present as the compatibility bridge.
 
 Everything else is deliberately absent — including `tool_state`,
@@ -157,7 +158,10 @@ Rationale: whitelisting means future schema columns can't silently leak.
 `channel_route_key`/`routine_id` are excluded so an imported session can never
 hijack a channel route or routine on the target device.
 
-`session_runs`: all columns except `id`. `session_tabs`: all columns as-is.
+History uses local `session_turns` when present, otherwise `session_runs`.
+The v2 wire key stays `runs`. Export only `EXPORT_TURN_FIELDS`, preserving known
+turn/body metadata and excluding `id` and unknown future columns.
+`session_tabs`: all columns as-is.
 
 ### Import rules
 
@@ -175,9 +179,11 @@ hijack a channel route or routine on the target device.
   must exist in local `agents` (else fail with a clear message). Current
   agentless destinations ignore the optional bundle field. `branched_from` is
   nulled if its referent is absent locally.
-- `session_runs`: insert without `id`; the UNIQUE `(session_id,
+- `session_turns` or `session_runs`: insert without `id`; the UNIQUE `(session_id,
   jsonl_read_offset)` index is satisfied because update-existing deletes rows
   first.
+- Preserve the source harness; advance an existing destination's transcript
+  revision to invalidate its cached transcript after replacement.
 - Refuse import when the local session `status == 'running'` (never overwrite
   a live session). Use `busy_timeout=5000` and `BEGIN IMMEDIATE`; if the DB
   is locked, abort cleanly with a retryable error.
@@ -400,8 +406,8 @@ by tests).
 
 - No message-level merge of diverged `messages.jsonl` (append-only
   assumption; divergence → conflict/fork).
-- No Windows/Linux service integration (daemon mode works there; launchd
-  only on macOS).
+- Linux has foreground daemon mode. Windows uses Task Scheduler with an
+  interactive user token, repeated `run-once`, and `IgnoreNew`; macOS uses launchd.
 - No multi-user roots (`u/0` only), single `agentId` per config.
 - No relay server; shared folder or SSH only.
 

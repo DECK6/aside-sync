@@ -1,0 +1,28 @@
+name: Compatibility
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  portable:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python: ['3.9', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest tests.test_latest_schema tests.test_windows tests.test_status tests.test_daemon -v
+      - if: runner.os == 'macOS'
+        run: python -m unittest discover -v
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'Aside Sync tools'
+          .\install.ps1 -ToolsDirectory $tools
+          & "$tools\aside-sync.cmd" --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed core launcher failed' }
+          & "$tools\aside-syncd.cmd" --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed daemon launcher failed' }

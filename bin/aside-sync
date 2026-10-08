@@ -29,8 +29,16 @@ EXPORT_SESSION_FIELDS = (
     "id", "agent_id", "parent_id", "branched_from", "title", "status",
     "system_prompt", "model", "permission_mode", "permission", "context_window",
     "cwd", "incognito", "created_at", "updated_at",
+    "harness_id", "transcript_revision",
 )
-OPTIONAL_EXPORT_SESSION_FIELDS = {"agent_id"}
+OPTIONAL_EXPORT_SESSION_FIELDS = {"agent_id", "harness_id", "transcript_revision"}
+EXPORT_TURN_FIELDS = (
+    "session_id", "user_message", "final_assistant_message", "files_changed",
+    "token_usage", "started_at", "last_message_timestamp", "finished_at",
+    "aborted_at", "abort_reason", "jsonl_read_offset", "jsonl_read_size",
+    "resume_attempts", "turn_id", "final_started_at", "body_version",
+    "steering_messages", "has_body", "trailing_messages",
+)
 EXCLUDED_SESSION_FIELDS = {
     "tool_state", "browser_binding", "active_tab_target_id", "queued_messages",
     "steering_messages", "suspension", "runtime_config", "trigger",
@@ -101,10 +109,18 @@ def table_columns(con: sqlite3.Connection, table: str) -> list[str]:
     return [str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")]
 
 
+def history_table(con: sqlite3.Connection) -> str:
+    # The wire key remains `runs` for v2 bundle interoperability.
+    for table in ("session_turns", "session_runs"):
+        if table_columns(con, table):
+            return table
+    raise SyncError("local state.db is missing required history table: session_turns or session_runs")
+
+
 def validate_local_schema(con: sqlite3.Connection) -> dict[str, list[str]]:
     found = {}
     for table, required in REQUIRED_LOCAL_COLUMNS.items():
-        cols = table_columns(con, table)
+        cols = table_columns(con, history_table(con) if table == "session_runs" else table)
         if not cols:
             raise SyncError(f"local state.db is missing required table: {table}")
         missing = required - set(cols)
@@ -258,6 +274,13 @@ def safe_member_name(name: str) -> None:
     pure = PurePosixPath(name)
     if pure.is_absolute() or ".." in pure.parts or not pure.parts or "\\" in name or "\x00" in name:
         raise SyncError(f"unsafe bundle member path: {name}")
+    for part in pure.parts:
+        # A POSIX-relative path can still escape or alias a device/ADS on Windows.
+        stem = part.split(".", 1)[0].upper()
+        if (any(c in part for c in ':<>"|?*') or any(ord(c) < 32 for c in part)
+                or part.endswith((".", " ")) or stem in {"CON", "PRN", "AUX", "NUL"}
+                or stem in {f"{prefix}{n}" for prefix in ("COM", "LPT") for n in range(1, 10)}):
+            raise SyncError(f"bundle path is not Windows-portable: {name}")
 
 
 def safe_component(value: object, label: str) -> str:
@@ -265,6 +288,7 @@ def safe_component(value: object, label: str) -> str:
         raise SyncError(f"invalid {label}")
     if "/" in value or "\\" in value or "\x00" in value or Path(value).name != value:
         raise SyncError(f"unsafe {label}: {value!r}")
+    safe_member_name(value)
     return value
 
 
@@ -444,10 +468,14 @@ def export_bundle(args) -> None:
         session = dict(row)
         if set(session) != set(export_fields) or EXCLUDED_SESSION_FIELDS & set(session):
             raise SyncError("internal export whitelist invariant failed")
-        run_cols = [column for column in table_columns(con, "session_runs") if column != "id"]
+        history = history_table(con)
+        run_columns = table_columns(con, history)
+        run_cols = [column for column in EXPORT_TURN_FIELDS if column in run_columns]
+        if not {"session_id", "jsonl_read_offset"}.issubset(run_cols):
+            raise SyncError(f"source {history} is missing required history columns")
         tab_cols = table_columns(con, "session_tabs")
         runs = [dict(r) for r in con.execute(
-            f"SELECT {','.join(run_cols)} FROM session_runs WHERE session_id=? ORDER BY id", (sid,)
+            f"SELECT {','.join(run_cols)} FROM {history} WHERE session_id=? ORDER BY id", (sid,)
         )]
         tabs = [dict(r) for r in con.execute(
             f"SELECT {','.join(tab_cols)} FROM session_tabs WHERE session_id=? ORDER BY updated_at", (sid,)
@@ -526,6 +554,19 @@ def unique_destination(parent: Path, name: str) -> Path:
 
 
 def move_to_trash(path: Path, trash_dir: Path | None = None) -> Path:
+    if sys.platform == "win32" and trash_dir is None:
+        environment = os.environ.copy()
+        environment["ASIDE_SYNC_TRASH_PATH"] = str(path.resolve())
+        script = (
+            "$ErrorActionPreference='Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; "
+            "$p=$env:ASIDE_SYNC_TRASH_PATH; "
+            "if ([IO.Directory]::Exists($p)) { "
+            "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin') "
+            "} else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin') }"
+        )
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env=environment, check=True, capture_output=True, text=True)
+        return path  # Receipt identifies the recycled source; Windows owns its new location.
     trash = trash_dir or (Path.home() / ".Trash")
     trash.mkdir(parents=True, exist_ok=True)
     target = unique_destination(trash, f"{path.name}.{now_stamp()}")
@@ -573,6 +614,7 @@ def import_bundle(args) -> None:
         con = connect_db(database)
         try:
             columns = validate_local_schema(con)
+            history = history_table(con)
             agent_scoped = "agent_id" in columns["sessions"]
             source_session = db_data["session"]
             agent_id = safe_component(
@@ -664,7 +706,7 @@ def import_bundle(args) -> None:
                     if "locked" in str(exc).lower() or "busy" in str(exc).lower():
                         raise SyncError("state.db is locked; retry import later") from exc
                     raise
-                current = con.execute("SELECT status FROM sessions WHERE id=?", (sid,)).fetchone()
+                current = con.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
                 if current and current["status"] == "running":
                     raise SyncError(f"refusing to overwrite running session: {sid}")
                 if current and not update:
@@ -676,12 +718,17 @@ def import_bundle(args) -> None:
                 installed_destination = True
 
                 if existing:
-                    con.execute("DELETE FROM session_runs WHERE session_id=?", (sid,))
+                    con.execute(f"DELETE FROM {history} WHERE session_id=?", (sid,))
                     con.execute("DELETE FROM session_tabs WHERE session_id=?", (sid,))
                     con.execute("DELETE FROM sessions WHERE id=?", (sid,))
 
                 session = {key: value for key, value in source_session.items() if key in EXPORT_SESSION_FIELDS}
                 session["id"] = sid
+                if "transcript_revision" in columns["sessions"]:
+                    session["transcript_revision"] = max(
+                        int(source_session.get("transcript_revision") or 0),
+                        int(current["transcript_revision"] or 0) + 1 if current else 0,
+                    )
                 if agent_scoped:
                     session["agent_id"] = agent_id
                 branch = source_session.get("branched_from")
@@ -711,9 +758,9 @@ def import_bundle(args) -> None:
                 for source_run in db_data["runs"]:
                     if not isinstance(source_run, dict):
                         raise SyncError("db.json run entries must be objects")
-                    run_row = dict(source_run)
+                    run_row = {key: value for key, value in source_run.items() if key in EXPORT_TURN_FIELDS}
                     run_row["session_id"] = sid
-                    insert_row(con, "session_runs", run_row, columns["session_runs"], exclude={"id"})
+                    insert_row(con, history, run_row, columns["session_runs"], exclude={"id"})
 
                 for source_tab in db_data["tabs"]:
                     if not isinstance(source_tab, dict) or not source_tab.get("target_id"):

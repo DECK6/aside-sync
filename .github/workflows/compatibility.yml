@@ -5,6 +5,7 @@ permissions:
 jobs:
   portable:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
         python: ['3.9', '3.14']

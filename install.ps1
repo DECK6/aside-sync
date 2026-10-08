@@ -3,7 +3,8 @@
 param([string]$ToolsDirectory = (Join-Path $env:USERPROFILE '.aside\tools'))
 $ErrorActionPreference = 'Stop'
 
-$probe = 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ required"; print(sys.executable)'
+# Embedded double quotes are split by Windows PowerShell 5.1 native argument passing.
+$probe = 'import sys; assert sys.version_info >= (3, 9); print(sys.executable)'
 if (Get-Command py -ErrorAction SilentlyContinue) {
     $python = & py -3 -c $probe
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
@@ -11,7 +12,7 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 } else {
     throw 'Install Python 3.9 or newer, then run install.ps1 again.'
 }
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $python)) {
+if ($LASTEXITCODE -ne 0 -or -not $python -or -not (Test-Path -LiteralPath $python)) {
     throw 'A working Python 3.9+ interpreter is required.'
 }
 
